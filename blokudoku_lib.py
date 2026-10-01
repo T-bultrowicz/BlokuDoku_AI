@@ -90,14 +90,15 @@ def _get_valid_placement_mask(board: np.ndarray, idx: int) -> np.ndarray:
 
     return valid_mask
 
-
 class RandomFactory:
     def __init__(self, seed=RANDOM_SEED):
         self._seed = seed
         self._random = r.Random(seed)
 
     def new_blocks(self):
-        return r.sample(range(BLOCKS_SIZE), BLOCKS_TO_PICK)
+        tmp = r.sample(range(BLOCKS_SIZE), BLOCKS_TO_PICK)
+        tmp.sort()
+        return tmp
 
     def explore_now(self, eps=EPS_DEF):
         return self._random.random() < eps
@@ -123,33 +124,44 @@ class State:
         ).astype(np.float32)
 
     def _calculate_strikes(self, block: list, x: int, y: int):
-        rwrd = 9 if self._streak else 0
         streak = False
-
-        set_xs = {x + dx for dx, _ in block}
-        set_ys = {y + dy for _, dy in block}
-        set_squares = set()
+        rwrd = 0
+        # Check for completed rows, columns, and 3x3 squares, note them
+        hits = []
         for dx, dy in block:
-            set_squares.add(((x + dx) / 3, (y + dy) / 3))
+            x0 = x + dx
+            y0 = y + dy
+            hit = False
 
-        for xs in set_xs:
-            if self._board[xs, :].all():
-                rwrd += 9
-                self._board[xs, :] = False
-                streak = True
+            if self._board[x0, :].all():
+                hits.append((0, x0))
+                hit = True
+            if self._board[:, y0].all():
+                hits.append((1, y0))
+                hit = True
+            sq_x = (x0 // 3) * 3
+            sq_y = (y0 // 3) * 3
+            if self._board[sq_x:sq_x + 3, sq_y:sq_y + 3].all():
+                hits.append((2, sq_x + sq_y * 8))
+                hit = True
 
-        for ys in set_ys:
-            if self._board[:, ys].all():
-                rwrd += 9
-                self._board[:, ys] = False
-                streak = True
+            if not hit: 
+                rwrd += 1
+            else:
+                streak = True 
 
-        for x0, y0 in set_squares:
-            if self._board[x0:x0 + 3, y0:y0 + 3].all():
-                rwrd += 9
-                self._board[x0:x0 + 3, y0:y0 + 3] = False
-                streak = True
+        for what, id in hits:
+            if what == 0:
+                self._board[id, :] = False
+            elif what == 1:
+                self._board[:, id] = True
+            else:
+                org_x = id % 8
+                org_y = id // 8
+                self._board[org_x:org_x+3, org_y:org_y+3] = False
 
+        rwrd += streak * 9
+        rwrd += len(hits) * 9
         return rwrd, streak
 
     def _calculate_mask(self):
@@ -184,7 +196,7 @@ class State:
         # calculate reward and a new board
         rwrd, self._streak = self._calculate_strikes(block, x, y)
 
-        # check if we need to pick new blocks
+        # check if we need to sample new blocks
         if self._count == 0:
             self._available = self.rng.new_blocks()
             self._blocks[self._available] = True
@@ -198,20 +210,34 @@ class State:
         return copy.deepcopy(self)
 
 if __name__ == "__main__":
-    x = State()
-    print(x._blocks)
-    print(x._board)
-    rng = RandomFactory()
-    print(rng.new_blocks())
-    print(len(x.neural_input()))
-    print(x.neural_input())
+    # x = State()
+    # print(x._blocks)
+    # print(x._board)
+    # rng = RandomFactory()
+    # print(rng.new_blocks())
+    # print(len(x.neural_input()))
+    # print(x.neural_input())
 
-    for block in BLOCKS:
-        arr = np.zeros(BOARD_SIZE, np.int8)
-        for dx, dy in block:
-            arr[4 + dx, 4 + dy] = 1
-        print(arr)
-        print('\n\n')
+    # for block in BLOCKS:
+    #     arr = np.zeros(BOARD_SIZE, np.int8)
+    #     for dx, dy in block:
+    #         arr[4 + dx, 4 + dy] = 1
+    #     print(arr)
+    #     print('\n\n')
+
+    st = State()
+    print("INITIAL STATE!!")
+    print(st._board.astype(int))
+    print(st._blocks.astype(int))
+    print(st._available)
+
+    print("\n\nREWARD, IS_MOVE_FINISHING, MASK_OF_ILLEGAL_MOVES!")
+    print(st.transition(0, 4, 4))
+
+
+    print("\n\nAFTERWARDS STATE!")
+    print(st._board.astype(int))
+    print(st._blocks.astype(int))
 
 del copy
 del math
