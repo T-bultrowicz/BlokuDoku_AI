@@ -1,4 +1,5 @@
 import copy
+import math
 import numpy as np
 import random as r
 
@@ -63,10 +64,32 @@ BLOCKS_SIZE = len(BLOCKS)
 BLOCKS_TO_PICK = 3
 
 BOARD_FLAT = 81
+BOARD_LEN = 9
 BOARD_SIZE = (9, 9)
 
 RANDOM_SEED = 13579
 EPS_DEF = 0.01
+
+NN_INPUT_SIZE = BOARD_FLAT + BLOCKS_SIZE + 1
+NN_OUTPUT_3D = (BLOCKS_TO_PICK, BOARD_LEN, BOARD_LEN)
+NN_OUTPUT_FLAT = BLOCKS_TO_PICK * BOARD_FLAT
+
+def _get_valid_placement_mask(board: np.ndarray, idx: int) -> np.ndarray:
+    block = BLOCKS[idx]
+    valid_mask = np.ones(BOARD_SIZE, dtype=np.bool)
+    n = BOARD_LEN
+
+    for dx, dy in block:
+        invalid_positions = board[max(0, dx):min(n, n + dx), 
+                                  max(0, dy):min(n, n + dy)]
+
+        current_valid = np.zeros(BOARD_SIZE, dtype=np.bool)
+        current_valid[max(0, -dx):min(n, n - dx), 
+                      max(0, -dy):min(n, n - dy)] = ~invalid_positions
+        valid_mask &= current_valid
+
+    return valid_mask
+
 
 class RandomFactory:
     def __init__(self, seed=RANDOM_SEED):
@@ -89,11 +112,63 @@ class State:
 
         self._available = self.rng.new_blocks()
         self._blocks[self._available] = True
-        self._streak = 0
+        self._streak = False
     
     def neural_input(self):
         tmp_board = self._board.reshape(BOARD_FLAT)
-        return np.concat((tmp_board, self._blocks)).astype(np.float64)
+        return np.concat((
+            tmp_board, 
+            self._blocks, 
+            [self._streak])
+        ).astype(np.float32)
+
+    def _calculate_strikes(self, block: list, x: int, y: int):
+        rwrd = 9 if self._streak else 0
+        streak = False
+
+        set_xs = {x + dx for dx, _ in block}
+        set_ys = {y + dy for _, dy in block}
+        set_squares = set()
+        for dx, dy in block:
+            set_squares.add(((x + dx) / 3, (y + dy) / 3))
+
+        for xs in set_xs:
+            if self._board[xs, :].all():
+                rwrd += 9
+                self._board[xs, :] = False
+                streak = True
+
+        for ys in set_ys:
+            if self._board[:, ys].all():
+                rwrd += 9
+                self._board[:, ys] = False
+                streak = True
+
+        for x0, y0 in set_squares:
+            if self._board[x0:x0 + 3, y0:y0 + 3].all():
+                rwrd += 9
+                self._board[x0:x0 + 3, y0:y0 + 3] = False
+                streak = True
+
+        return rwrd, streak
+
+    def _calculate_mask(self):
+        mask = np.zeros(NN_OUTPUT_3D, np.bool)
+        mask[0, :, :] = _get_valid_placement_mask(self._board, self._available[0])
+
+        if self._count == 1:
+            mask[1, :, :] = False
+            mask[2, :, :] = False
+        elif self._count == 2:
+            mask[1, :, :] = _get_valid_placement_mask(self._board, self._available[1])
+            mask[2, :, :] = False
+        elif self._count == 3:
+            mask[1, :, :] = _get_valid_placement_mask(self._board, self._available[1])
+            mask[2, :, :] = _get_valid_placement_mask(self._board, self._available[2])
+        else:
+            raise ValueError(f"_count value: {self._count} is not in range 1-3!")
+
+        return mask.reshape(NN_OUTPUT_FLAT)
 
     def transition(self, piece: int, x: int, y: int):
         block_id = self._available[piece]
@@ -107,14 +182,17 @@ class State:
             self._board[x + dx, y + dy] = True
 
         # calculate reward and a new board
-
-        # check if we are a terminal state
+        rwrd, self._streak = self._calculate_strikes(block, x, y)
 
         # check if we need to pick new blocks
         if self._count == 0:
             self._available = self.rng.new_blocks()
             self._blocks[self._available] = True
             self._count = BLOCKS_TO_PICK
+
+        # check if we are terminal state and return the mask of illegal moves
+        mask = self._calculate_mask()
+        return rwrd, bool(not mask.any()), mask
 
     def copy(self):
         return copy.deepcopy(self)
@@ -126,6 +204,7 @@ if __name__ == "__main__":
     rng = RandomFactory()
     print(rng.new_blocks())
     print(len(x.neural_input()))
+    print(x.neural_input())
 
     for block in BLOCKS:
         arr = np.zeros(BOARD_SIZE, np.int8)
@@ -135,5 +214,6 @@ if __name__ == "__main__":
         print('\n\n')
 
 del copy
+del math
 del np
 del r
