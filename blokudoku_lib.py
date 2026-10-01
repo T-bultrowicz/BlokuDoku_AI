@@ -61,6 +61,7 @@ BLOCKS = [
     [(0, 0), (1, 0), (-1, 0), (0, 1), (0, -1)],
 ]
 BLOCKS_SIZE = len(BLOCKS)
+EMPTY_SLOT = len(BLOCKS)
 BLOCKS_TO_PICK = 3
 
 BOARD_FLAT = 81
@@ -70,20 +71,19 @@ BOARD_SIZE = (9, 9)
 RANDOM_SEED = 13579
 EPS_DEF = 0.01
 
-NN_INPUT_SIZE = BOARD_FLAT + BLOCKS_SIZE + 1
 NN_OUTPUT_3D = (BLOCKS_TO_PICK, BOARD_LEN, BOARD_LEN)
 NN_OUTPUT_FLAT = BLOCKS_TO_PICK * BOARD_FLAT
 
 def _get_valid_placement_mask(board: np.ndarray, idx: int) -> np.ndarray:
     block = BLOCKS[idx]
-    valid_mask = np.ones(BOARD_SIZE, dtype=np.bool)
+    valid_mask = np.ones(BOARD_SIZE, dtype=bool)
     n = BOARD_LEN
 
     for dx, dy in block:
         invalid_positions = board[max(0, dx):min(n, n + dx), 
                                   max(0, dy):min(n, n + dy)]
 
-        current_valid = np.zeros(BOARD_SIZE, dtype=np.bool)
+        current_valid = np.zeros(BOARD_SIZE, dtype=bool)
         current_valid[max(0, -dx):min(n, n - dx), 
                       max(0, -dy):min(n, n - dy)] = ~invalid_positions
         valid_mask &= current_valid
@@ -96,7 +96,7 @@ class RandomFactory:
         self._random = r.Random(seed)
 
     def new_blocks(self):
-        tmp = r.sample(range(BLOCKS_SIZE), BLOCKS_TO_PICK)
+        tmp = self._random.sample(range(BLOCKS_SIZE), BLOCKS_TO_PICK)
         tmp.sort()
         return tmp
 
@@ -107,42 +107,40 @@ class State:
     rng = RandomFactory()
 
     def __init__(self):
-        self._board = np.zeros(BOARD_SIZE, np.bool)
-        self._blocks = np.zeros(BLOCKS_SIZE, np.bool)
+        self._board = np.zeros(BOARD_SIZE, bool)
         self._count = BLOCKS_TO_PICK
-
         self._available = self.rng.new_blocks()
-        self._blocks[self._available] = True
         self._streak = False
     
-    def neural_input(self):
-        tmp_board = self._board.reshape(BOARD_FLAT)
-        return np.concat((
-            tmp_board, 
-            self._blocks, 
-            [self._streak])
-        ).astype(np.float32)
+    def in_nn_board(self):
+        return self._board.astype(np.float32)
+    
+    def in_nn_pieces(self):
+        tmp = self._available
+        for i in range(len(tmp), 3):
+            tmp.append(EMPTY_SLOT)
+        return tmp
 
     def _calculate_strikes(self, block: list, x: int, y: int):
         streak = False
         rwrd = 0
         # Check for completed rows, columns, and 3x3 squares, note them
-        hits = []
+        hits = set()
         for dx, dy in block:
             x0 = x + dx
             y0 = y + dy
             hit = False
 
             if self._board[x0, :].all():
-                hits.append((0, x0))
+                hits.add((0, x0))
                 hit = True
             if self._board[:, y0].all():
-                hits.append((1, y0))
+                hits.add((1, y0))
                 hit = True
             sq_x = (x0 // 3) * 3
             sq_y = (y0 // 3) * 3
             if self._board[sq_x:sq_x + 3, sq_y:sq_y + 3].all():
-                hits.append((2, sq_x + sq_y * 8))
+                hits.add((2, sq_x + sq_y * 8))
                 hit = True
 
             if not hit: 
@@ -154,7 +152,7 @@ class State:
             if what == 0:
                 self._board[id, :] = False
             elif what == 1:
-                self._board[:, id] = True
+                self._board[:, id] = False
             else:
                 org_x = id % 8
                 org_y = id // 8
@@ -165,7 +163,7 @@ class State:
         return rwrd, streak
 
     def _calculate_mask(self):
-        mask = np.zeros(NN_OUTPUT_3D, np.bool)
+        mask = np.zeros(NN_OUTPUT_3D, bool)
         mask[0, :, :] = _get_valid_placement_mask(self._board, self._available[0])
 
         if self._count == 1:
@@ -189,7 +187,6 @@ class State:
         # make move
         self._count -= 1
         self._available.remove(block_id)
-        self._blocks[block_id] = False
         for dx, dy in BLOCKS[block_id]:
             self._board[x + dx, y + dy] = True
 
@@ -199,7 +196,6 @@ class State:
         # check if we need to sample new blocks
         if self._count == 0:
             self._available = self.rng.new_blocks()
-            self._blocks[self._available] = True
             self._count = BLOCKS_TO_PICK
 
         # check if we are terminal state and return the mask of illegal moves
@@ -228,8 +224,11 @@ if __name__ == "__main__":
     st = State()
     print("INITIAL STATE!!")
     print(st._board.astype(int))
-    print(st._blocks.astype(int))
     print(st._available)
+
+    print("\n\nNEURAL OUTPUT!!")
+    print(st.in_nn_board().astype(int))
+    print(st.in_nn_pieces())
 
     print("\n\nREWARD, IS_MOVE_FINISHING, MASK_OF_ILLEGAL_MOVES!")
     print(st.transition(0, 4, 4))
@@ -237,7 +236,11 @@ if __name__ == "__main__":
 
     print("\n\nAFTERWARDS STATE!")
     print(st._board.astype(int))
-    print(st._blocks.astype(int))
+
+    print("\n\nAFTERWARDS NEURAL OUTPUT")
+    print(st.in_nn_board().astype(int))
+    print(st.in_nn_pieces())
+
 
 del copy
 del math
