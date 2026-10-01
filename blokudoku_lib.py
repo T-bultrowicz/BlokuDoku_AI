@@ -69,7 +69,6 @@ BOARD_LEN = 9
 BOARD_SIZE = (9, 9)
 
 RANDOM_SEED = 13579
-EPS_DEF = 0.01
 
 NN_OUTPUT_3D = (BLOCKS_TO_PICK, BOARD_LEN, BOARD_LEN)
 NN_OUTPUT_FLAT = BLOCKS_TO_PICK * BOARD_FLAT
@@ -91,7 +90,7 @@ def _get_valid_placement_mask(board: np.ndarray, idx: int) -> np.ndarray:
     return valid_mask
 
 class RandomFactory:
-    def __init__(self, seed=RANDOM_SEED):
+    def __init__(self, seed):
         self._seed = seed
         self._random = r.Random(seed)
 
@@ -100,11 +99,11 @@ class RandomFactory:
         tmp.sort()
         return tmp
 
-    def explore_now(self, eps=EPS_DEF):
+    def explore_now(self, eps=0.0):
         return self._random.random() < eps
 
 class State:
-    rng = RandomFactory()
+    rng = RandomFactory(RANDOM_SEED)
 
     def __init__(self):
         self._board = np.zeros(BOARD_SIZE, bool)
@@ -113,13 +112,16 @@ class State:
         self._streak = False
     
     def in_nn_board(self):
-        return self._board.astype(np.float32)
+        return self._board
     
     def in_nn_pieces(self):
-        tmp = self._available
+        tmp = self._available.copy()
         for i in range(len(tmp), 3):
             tmp.append(EMPTY_SLOT)
         return tmp
+
+    def in_nn_streak(self):
+        return self._streak
 
     def _calculate_strikes(self, block: list, x: int, y: int):
         streak = False
@@ -227,7 +229,7 @@ if __name__ == "__main__":
     print(st._available)
 
     print("\n\nNEURAL OUTPUT!!")
-    print(st.in_nn_board().astype(int))
+    print(st.in_nn_board())
     print(st.in_nn_pieces())
 
     print("\n\nREWARD, IS_MOVE_FINISHING, MASK_OF_ILLEGAL_MOVES!")
@@ -238,7 +240,7 @@ if __name__ == "__main__":
     print(st._board.astype(int))
 
     print("\n\nAFTERWARDS NEURAL OUTPUT")
-    print(st.in_nn_board().astype(int))
+    print(st.in_nn_board())
     print(st.in_nn_pieces())
 
 
