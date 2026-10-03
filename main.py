@@ -1,4 +1,6 @@
 import blokudoku_lib as bl
+import user_play as user_play
+
 import numpy as np
 import sys
 import time
@@ -6,11 +8,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-GAMES_TO_PLAY = 10000000
-GAMES_TO_EXCHANGE_NETS = 10000
+GAMES_TO_PLAY = 3
+GAMES_TO_EXCHANGE_NETS = 40
+GAMES_TO_DISPLAY_INFO = 1000
 EPS_MAX = 1.0
 EPS_MIN = 0.025
-DECAY_RATE = 0.999985
+DECAY_RATE = 0.999995
 DISCOUNT = 0.99
 LEARN_MOVE = 4
 BATCH_SIZE = 32
@@ -201,25 +204,31 @@ def train():
 
         all_rewards.append(total_rwrd)
         games_played = game_num + 1
-        if games_played % GAMES_TO_EXCHANGE_NETS == 0:
+        if games_played % GAMES_TO_DISPLAY_INFO == 0:
             # PRINT STATISTICS OF TRAINING
             elapsed = time.perf_counter() - batch_start_time
-            games_per_second = GAMES_TO_EXCHANGE_NETS / elapsed if elapsed else float("inf")
-            print(f"Played {games_played} games, last batch stats:\n")
-            print(f"Points reached: {np.mean(all_rewards)}, eps: {eps}!\n")
-            print(f"Batch time: {elapsed:.2f}s, games per second: {games_per_second:.2f}\n")
+            games_per_second = GAMES_TO_DISPLAY_INFO / elapsed if elapsed else float("inf")
+
+            print(f"Played {games_played} games, last batch of {GAMES_TO_DISPLAY_INFO} games:")
+            print(f"Average points per game: {np.mean(all_rewards)}, eps: {eps}!")
+            print(f"Batch time: {elapsed:.2f}s, games per second: {games_per_second:.2f}\n\n")
+
             batch_start_time = time.perf_counter()
             all_rewards.clear()
 
+        if games_played % GAMES_TO_EXCHANGE_NETS == 0:
             # LOAD TARGET NET WITH MAIN NET'S WEIGHTS
             target_net.load_state_dict(main_net.state_dict())
+
+    main_net_path = "main_net.pt"
+    torch.save(main_net.state_dict(), main_net_path)
 
             
             
                 
 def main(args):
     if len(args) != 2:
-       print(f"Main needs one argument, but received: {len(args) - 1} arguments!")
+       print(f"Main needs one argument, but received: {len(args) - 1} arguments! Type './executable usage' for help!")
        return 0
 
     if args[1] == "train":
@@ -227,7 +236,7 @@ def main(args):
     elif args[1] == "test":
         raise RuntimeError("Not implemented yet!")
     elif args[1] == "play_as_player":
-        raise RuntimeError("Not implemented yet!")
+        user_play.play_as_player()
     elif args[1] == "watch_ai_play":
         raise RuntimeError("Not implemented yet!")
     elif args[1] == "usage":

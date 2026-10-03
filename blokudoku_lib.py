@@ -123,7 +123,7 @@ class State:
         self._streak = False
     
     def in_board(self):
-        return self._board
+        return self._board.copy()
     
     def in_blocks(self):
         tmp = self._available.copy()
@@ -172,7 +172,7 @@ class State:
                 self._board[org_x:org_x+3, org_y:org_y+3] = False
 
         rwrd += streak * self._streak * 9
-        rwrd += len(hits) * 9
+        rwrd += len(hits) * 18
         return rwrd, streak
 
     def calculate_mask(self):
