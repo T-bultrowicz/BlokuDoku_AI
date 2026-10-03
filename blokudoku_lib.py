@@ -1,7 +1,7 @@
 import copy
 import math
 import numpy as np
-import random as r
+import random as rand
 
 BLOCKS = [
     # SQUARE PIECES
@@ -89,38 +89,49 @@ def _get_valid_placement_mask(board: np.ndarray, idx: int) -> np.ndarray:
 
     return valid_mask
 
+def decode_action(action: int):
+    piece = action // BOARD_FLAT
+    pos = action % BOARD_FLAT
+    x = pos // BOARD_LEN
+    y = pos % BOARD_LEN
+    return piece, x, y
+
 class RandomFactory:
     def __init__(self, seed):
         self._seed = seed
-        self._random = r.Random(seed)
+        self._random = rand.Random(seed)
 
     def new_blocks(self):
-        tmp = self._random.sample(range(BLOCKS_SIZE), BLOCKS_TO_PICK)
-        tmp.sort()
-        return tmp
+        return self._random.choices(range(BLOCKS_SIZE), k=BLOCKS_TO_PICK)
 
-    def explore_now(self, eps=0.0):
+    def sample(self, list, k: int = 1):
+        return self._random.sample(list, k)
+
+    def choice(self, list) -> int:
+        return self._random.choice(list)
+
+    def explore_now(self, eps: float=0.0):
         return self._random.random() < eps
 
-class State:
-    rng = RandomFactory(RANDOM_SEED)
+rng_fact_instance = RandomFactory(RANDOM_SEED)
 
+class State:
     def __init__(self):
         self._board = np.zeros(BOARD_SIZE, bool)
         self._count = BLOCKS_TO_PICK
-        self._available = self.rng.new_blocks()
+        self._available = rng_fact_instance.new_blocks()
         self._streak = False
     
-    def in_nn_board(self):
+    def in_board(self):
         return self._board
     
-    def in_nn_pieces(self):
+    def in_blocks(self):
         tmp = self._available.copy()
         for i in range(len(tmp), 3):
             tmp.append(EMPTY_SLOT)
-        return tmp
+        return np.array(tmp, dtype=np.int8)
 
-    def in_nn_streak(self):
+    def in_streak(self):
         return self._streak
 
     def _calculate_strikes(self, block: list, x: int, y: int):
@@ -160,11 +171,11 @@ class State:
                 org_y = id // 8
                 self._board[org_x:org_x+3, org_y:org_y+3] = False
 
-        rwrd += streak * 9
+        rwrd += streak * self._streak * 9
         rwrd += len(hits) * 9
         return rwrd, streak
 
-    def _calculate_mask(self):
+    def calculate_mask(self):
         mask = np.zeros(NN_OUTPUT_3D, bool)
         mask[0, :, :] = _get_valid_placement_mask(self._board, self._available[0])
 
@@ -188,20 +199,22 @@ class State:
 
         # make move
         self._count -= 1
-        self._available.remove(block_id)
+        self._available.pop(piece)
         for dx, dy in BLOCKS[block_id]:
             self._board[x + dx, y + dy] = True
 
         # calculate reward and a new board
         rwrd, self._streak = self._calculate_strikes(block, x, y)
+        if not self._board.any():
+            rwrd += 100
 
         # check if we need to sample new blocks
         if self._count == 0:
-            self._available = self.rng.new_blocks()
+            self._available = rng_fact_instance.new_blocks()
             self._count = BLOCKS_TO_PICK
 
         # check if we are terminal state and return the mask of illegal moves
-        mask = self._calculate_mask()
+        mask = self.calculate_mask()
         return rwrd, bool(not mask.any()), mask
 
     def copy(self):
@@ -229,8 +242,8 @@ if __name__ == "__main__":
     print(st._available)
 
     print("\n\nNEURAL OUTPUT!!")
-    print(st.in_nn_board())
-    print(st.in_nn_pieces())
+    print(st.in_board())
+    print(st.in_blocks())
 
     print("\n\nREWARD, IS_MOVE_FINISHING, MASK_OF_ILLEGAL_MOVES!")
     print(st.transition(0, 4, 4))
@@ -240,11 +253,7 @@ if __name__ == "__main__":
     print(st._board.astype(int))
 
     print("\n\nAFTERWARDS NEURAL OUTPUT")
-    print(st.in_nn_board())
-    print(st.in_nn_pieces())
+    print(st.in_board())
+    print(st.in_blocks())
 
-
-del copy
-del math
-del np
-del r
+    print(type(st._available))
