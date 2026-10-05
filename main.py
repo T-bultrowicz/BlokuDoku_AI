@@ -8,22 +8,27 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-GAMES_TO_PLAY = 3
-GAMES_TO_EXCHANGE_NETS = 40
+MAIN_NET_PATH = "main_net.pt"
+
+GAMES_TO_PLAY = 125000
+GAMES_IN_PARALLEL = 16
+
+EXCHANGE_NETS_FREQ = 250
 GAMES_TO_DISPLAY_INFO = 1000
+
+VALIDATION_GAMES_PER_BATCH = 5
 EPS_MAX = 1.0
 EPS_MIN = 0.025
 DECAY_RATE = 0.999995
-DISCOUNT = 0.99
-LEARN_MOVE = 4
-BATCH_SIZE = 32
-
+DISCOUNT = 0.999
+BATCH_SIZE = 128
+LEARING_OPTIM_RATE = 1e-4
 
 IN_CONV_CHANNELS = 1
 OUT_CONV_CHANNELS_1 = 32
 OUT_CONV_CHANNELS_2 = 64
 OUT_CONV_CHANNELS_3 = 64
-OUT_CONV_CHANNELS_4 = 16
+OUT_CONV_CHANNELS_4 = 32
 KERNEL_SIZE = (3, 3)
 PADDING = 1
 
@@ -69,42 +74,58 @@ class BLOCK_Q_Network(nn.Module):
         return self.afterwards_net(final_input)
 
 RECORDS_CAPACITY = 100000
-class RecordStorage():
+
+class RecordStorage:
     def __init__(self):
-        self.boards_s = np.zeros((RECORDS_CAPACITY, 1, bl.BOARD_LEN, bl.BOARD_LEN), dtype=bool)
-        self.blocks_s = np.zeros((RECORDS_CAPACITY, bl.BLOCKS_TO_PICK), dtype=np.int8)
-        self.streaks_s = np.zeros((RECORDS_CAPACITY, 1), dtype=bool)
+        self.boards_s = np.empty((RECORDS_CAPACITY, 1, bl.BOARD_LEN, bl.BOARD_LEN), dtype=bool)
+        self.blocks_s = np.empty((RECORDS_CAPACITY, bl.BLOCKS_TO_PICK), dtype=np.int8)
+        self.streaks_s = np.empty((RECORDS_CAPACITY, 1), dtype=bool)
 
-        self.boards_f = np.zeros((RECORDS_CAPACITY, 1, bl.BOARD_LEN, bl.BOARD_LEN), dtype=bool)
-        self.blocks_f = np.zeros((RECORDS_CAPACITY, bl.BLOCKS_TO_PICK), dtype=np.int8)
-        self.streaks_f = np.zeros((RECORDS_CAPACITY, 1), dtype=bool)
+        self.boards_f = np.empty((RECORDS_CAPACITY, 1, bl.BOARD_LEN, bl.BOARD_LEN), dtype=bool)
+        self.blocks_f = np.empty((RECORDS_CAPACITY, bl.BLOCKS_TO_PICK), dtype=np.int8)
+        self.streaks_f = np.empty((RECORDS_CAPACITY, 1), dtype=bool)
 
-        self.actions = np.zeros(RECORDS_CAPACITY, dtype=np.int16)
-        self.rewards = np.zeros(RECORDS_CAPACITY, dtype=np.uint16)
-        self.terminal = np.zeros(RECORDS_CAPACITY, dtype=bool)
-        self.masks_f = np.zeros((RECORDS_CAPACITY, OUT_LINEAR_DIM), dtype=bool)
+        self.actions = np.empty(RECORDS_CAPACITY, dtype=np.int16)
+        self.rewards = np.empty(RECORDS_CAPACITY, dtype=np.int16)
+        self.terminal = np.empty(RECORDS_CAPACITY, dtype=bool)
+        self.masks_f = np.empty((RECORDS_CAPACITY, OUT_LINEAR_DIM), dtype=bool)
 
         self.offset = 0
         self.size = 0
 
-    def add_record(self, board_s: np.ndarray, blocks_s: np.ndarray, streak_s: bool,
-                         board_f: np.ndarray, blocks_f: np.ndarray, streak_f: bool,
-                         action: int, reward: int, terminal: bool, mask_f: np.ndarray):
-        self.boards_s[self.offset] = [board_s]
-        self.blocks_s[self.offset] = blocks_s
-        self.streaks_s[self.offset] = [streak_s]
+    def _write_arrays(self, incoming_data: tuple, n: int):
+        buffers = (
+            self.boards_s, self.blocks_s, self.streaks_s,
+            self.boards_f, self.blocks_f, self.streaks_f,
+            self.actions, self.rewards, self.terminal, self.masks_f
+        )
 
-        self.boards_f[self.offset] = [board_f]
-        self.blocks_f[self.offset] = blocks_f
-        self.streaks_f[self.offset] = [streak_f]
+        if self.offset + n <= RECORDS_CAPACITY:
+            for buf, data in zip(buffers, incoming_data):
+                buf[self.offset : self.offset + n] = data
+        else:
+            space_left = RECORDS_CAPACITY - self.offset
+            remainder = n - space_left
 
-        self.actions[self.offset] = action
-        self.rewards[self.offset] = reward
-        self.terminal[self.offset] = terminal
-        self.masks_f[self.offset] = mask_f
+            for buf, data in zip(buffers, incoming_data):
+                buf[self.offset : RECORDS_CAPACITY] = data[:space_left]
+                buf[0 : remainder] = data[space_left:]
 
-        self.offset = (self.offset + 1) % RECORDS_CAPACITY
-        self.size = min(self.size + 1, RECORDS_CAPACITY)
+    def add_records(self, boards_s: np.ndarray, blocks_s: np.ndarray, streaks_s: np.ndarray,
+                          boards_f: np.ndarray, blocks_f: np.ndarray, streaks_f: np.ndarray,
+                          actions: np.ndarray, rewards: np.ndarray, terminals: np.ndarray, 
+                          masks_f: np.ndarray):
+        
+        n = len(boards_s) # Amount of records to add.
+        incoming_data = (
+            boards_s, blocks_s, streaks_s,
+            boards_f, blocks_f, streaks_f,
+            actions, rewards, terminals, masks_f
+        )
+
+        self._write_arrays(incoming_data, n)
+        self.offset = (self.offset + n) % RECORDS_CAPACITY
+        self.size = min(self.size + n, RECORDS_CAPACITY)
 
     def sample(self, num_samples: int = 1):
         idx = bl.rng_fact_instance.sample(range(self.size), num_samples)
@@ -121,110 +142,141 @@ class RecordStorage():
             self.masks_f[idx]
         )
 
-def train():
+def validate_model(model: BLOCK_Q_Network, num_games: int = 1):
+    total_score = 0
+    for _ in range(num_games):
+        st_nw = bl.State()
+        curr_mask = st_nw.calculate_mask()
+        game_over = False
+        while not game_over:
+            board, blocks, streak = st_nw.in_board(), st_nw.in_blocks(), st_nw.in_streak()
+
+            nn_board = torch.from_numpy(board).float().unsqueeze(0)
+            nn_blocks = torch.from_numpy(blocks).long().unsqueeze(0)
+            nn_streak = torch.from_numpy(streak).float().view(1, 1)
+
+            with torch.no_grad():
+                y_hat_nn = model(nn_board, nn_blocks, nn_streak).squeeze(0)
+                y_hat_nn[~curr_mask] = -1e9
+
+            action = int(torch.argmax(y_hat_nn))
+            piece, x, y = bl.decode_action(action)
+
+            rwrd, is_terminal, new_mask = st_nw.transition(piece, x, y)
+            game_over = is_terminal
+            curr_mask = new_mask
+            total_score += rwrd
+
+    return f"Average points per game: {(total_score / num_games):.4f}"
+
+def _randomise(mask: np.ndarray):
+    valid_actions = np.flatnonzero(mask)
+    return bl.rng_fact_instance.choice(valid_actions)
+
+def train(games_count: int = GAMES_IN_PARALLEL):
     main_net = BLOCK_Q_Network()
     target_net = BLOCK_Q_Network()
     storage = RecordStorage()
 
-    moves = 0
-    eps = EPS_MAX
+    optimizer = torch.optim.Adam(main_net.parameters(), lr=LEARING_OPTIM_RATE)
     batch_start_time = time.perf_counter()
-    optimizer = torch.optim.Adam(main_net.parameters(), lr=1e-4)
-    all_rewards = []
+    eps = EPS_MAX
 
-    for game_num in range(GAMES_TO_PLAY):
-        st_nw = bl.State()
-        curr_mask = st_nw.calculate_mask()
-        game_over = False
-        total_rwrd = 0
+    states = [bl.State() for _ in range(games_count)]
+    games_played = 0
+    games_played_mod = 0
+    loops = 0
+    while games_played < GAMES_TO_PLAY:
+        masks = np.array([st.calculate_mask() for st in states])
+        boards = [st.in_board() for st in states]
+        blocks = [st.in_blocks() for st in states]
+        streaks = [st.in_streak() for st in states]
 
-        while not game_over:
-            eps = max(EPS_MIN, eps * DECAY_RATE)
-            board, blocks, streak = st_nw.in_board(), st_nw.in_blocks(), st_nw.in_streak()
+        nn_boards = torch.from_numpy(np.array(boards)).float()
+        nn_blocks = torch.from_numpy(np.array(blocks)).long()
+        nn_streaks = torch.from_numpy(np.array(streaks)).float()
 
-            nn_board = torch.from_numpy(board).float().unsqueeze(0).unsqueeze(0)
-            nn_blocks = torch.from_numpy(blocks).long().unsqueeze(0)
-            nn_streak = torch.from_numpy(np.array([[streak]], dtype=np.float32))
+        with torch.no_grad():
+            y_hat_nn = main_net(nn_boards, nn_blocks, nn_streaks)
+            y_hat_nn[~torch.from_numpy(masks)] = -1e9
+            best_actions = torch.argmax(y_hat_nn, dim=1).tolist()
+
+        decisions = [bl.rng_fact_instance.explore_now(eps)  for _ in range(games_count)]
+        actions = [
+            (_randomise(masks[i]) if decisions[i] else best_actions[i]) 
+            for i in range(games_count)
+        ]
+        decoded_actions = [bl.decode_action(actions[i]) for i in range(games_count)]
+
+        rewards = np.empty(games_count, dtype=np.int16)
+        terminals = np.empty(games_count, dtype=bool)
+        new_masks = np.empty((games_count, OUT_LINEAR_DIM), dtype=bool)
+        for i in range(games_count):
+            rewards[i], terminals[i], new_masks[i] = states[i].transition(*decoded_actions[i])
+
+        storage.add_records(
+            np.array(boards), np.array(blocks), np.array(streaks),
+            np.array([st.in_board() for st in states]),
+            np.array([st.in_blocks() for st in states]),
+            np.array([st.in_streak() for st in states]),
+            np.array(actions), rewards, terminals, new_masks
+        )
+
+        if storage.size >= BATCH_SIZE:
+            (in_brd_st1, in_blk_st1, in_str_st1, 
+             in_brd_st2, in_blk_st2, in_str_st2, 
+             b_actions, b_rewards, b_terminals, b_masks_f) = storage.sample(BATCH_SIZE)
+            b_terminals = torch.from_numpy(b_terminals).float()
+            b_rewards = torch.from_numpy(b_rewards).float()
+            
+            y_hat_nn_main = main_net(
+                torch.from_numpy(in_brd_st1).float(),
+                torch.from_numpy(in_blk_st1).long(),
+                torch.from_numpy(in_str_st1).float()
+            )
+            actions_t = torch.from_numpy(b_actions).long()
+            q_pred_fn = y_hat_nn_main[torch.arange(BATCH_SIZE), actions_t]
 
             with torch.no_grad():
-                y_hat_nn = main_net(nn_board, nn_blocks, nn_streak).squeeze(0)
-                y_hat_nn[~curr_mask] = -1e9
-
-            action = 0
-            if bl.rng_fact_instance.explore_now(eps):
-                actionss = np.flatnonzero(curr_mask).tolist()
-                action = bl.rng_fact_instance.choice(actionss)
-            else:
-                action = int(torch.argmax(y_hat_nn))
-            piece, x, y = bl.decode_action(action)
-            
-            rwrd, is_terminal, new_mask = st_nw.transition(piece, x, y)
-            storage.add_record(
-                board, blocks, streak,
-                st_nw.in_board(), st_nw.in_blocks(), st_nw.in_streak(),
-                action, rwrd, is_terminal, new_mask
-            )
-
-            # PERFORM LEARNING STEP ON THE MAIN NET
-            if moves % LEARN_MOVE == 0 and storage.size >= BATCH_SIZE:
-                (in_brd_st1, in_blk_st1, in_str_st1, 
-                 in_brd_st2, in_blk_st2, in_str_st2, 
-                 actions, rewards, terminals, masks_f) = storage.sample(BATCH_SIZE)
-                terminals = torch.from_numpy(terminals).float()
-                rewards = torch.from_numpy(rewards).float()
-                
-                y_hat_nn_main = main_net(
-                    torch.from_numpy(in_brd_st1).float(),
-                    torch.from_numpy(in_blk_st1).long(),
-                    torch.from_numpy(in_str_st1).float()
+                y_hat_nn_target = target_net(
+                    torch.from_numpy(in_brd_st2).float(),
+                    torch.from_numpy(in_blk_st2).long(),
+                    torch.from_numpy(in_str_st2).float()
                 )
-                actions_t = torch.from_numpy(actions).long()
-                q_pred_fn = y_hat_nn_main[torch.arange(BATCH_SIZE), actions_t]
+                y_hat_nn_target[~b_masks_f] = -1e9
+                target_moves = torch.max(y_hat_nn_target, dim=1).values
+            
+            target_fn = b_rewards + (1 - b_terminals) * DISCOUNT * target_moves
+            losses = F.mse_loss(q_pred_fn, target_fn)
 
-                with torch.no_grad():
-                    y_hat_nn_target = target_net(
-                        torch.from_numpy(in_brd_st2).float(),
-                        torch.from_numpy(in_blk_st2).long(),
-                        torch.from_numpy(in_str_st2).float()
-                    )
-                    y_hat_nn_target[~masks_f] = -1e9
-                    target_moves = torch.max(y_hat_nn_target, dim=1).values
-                
-                target_fn = rewards + (1 - terminals) * DISCOUNT * target_moves
-                losses = F.mse_loss(q_pred_fn, target_fn)
+            optimizer.zero_grad()
+            losses.backward()
+            optimizer.step()
 
-                optimizer.zero_grad()
-                losses.backward()
-                optimizer.step()
+        loops += 1
+        eps = max(EPS_MIN, eps * (DECAY_RATE ** games_count))
+        games_played += np.sum(terminals)
+        games_played_mod += np.sum(terminals)
+        for i in range(games_count):
+            if terminals[i]:
+                states[i] = bl.State()
+    
+        if loops % EXCHANGE_NETS_FREQ == 0:
+            target_net.load_state_dict(main_net.state_dict())
 
-            game_over = is_terminal
-            moves += 1
-            curr_mask = new_mask
-            total_rwrd += rwrd
-
-        all_rewards.append(total_rwrd)
-        games_played = game_num + 1
-        if games_played % GAMES_TO_DISPLAY_INFO == 0:
-            # PRINT STATISTICS OF TRAINING
+        if games_played_mod >= GAMES_TO_DISPLAY_INFO:
             elapsed = time.perf_counter() - batch_start_time
             games_per_second = GAMES_TO_DISPLAY_INFO / elapsed if elapsed else float("inf")
 
-            print(f"Played {games_played} games, last batch of {GAMES_TO_DISPLAY_INFO} games:")
-            print(f"Average points per game: {np.mean(all_rewards)}, eps: {eps}!")
-            print(f"Batch time: {elapsed:.2f}s, games per second: {games_per_second:.2f}\n\n")
+            print(f"Games played: {games_played}, Games per second: {games_per_second:.2f}, batch time: {elapsed:.2f}s, eps: {eps:.4f}")
+            print(f"Validating model performance...")
+            print(validate_model(main_net, VALIDATION_GAMES_PER_BATCH))
+            print("\n")
 
             batch_start_time = time.perf_counter()
-            all_rewards.clear()
+            games_played_mod %= GAMES_TO_DISPLAY_INFO
 
-        if games_played % GAMES_TO_EXCHANGE_NETS == 0:
-            # LOAD TARGET NET WITH MAIN NET'S WEIGHTS
-            target_net.load_state_dict(main_net.state_dict())
-
-    main_net_path = "main_net.pt"
-    torch.save(main_net.state_dict(), main_net_path)
-
-            
-            
+    torch.save(main_net.state_dict(), MAIN_NET_PATH)         
                 
 def main(args):
     if len(args) != 2:

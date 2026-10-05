@@ -72,6 +72,7 @@ RANDOM_SEED = 13579
 
 NN_OUTPUT_3D = (BLOCKS_TO_PICK, BOARD_LEN, BOARD_LEN)
 NN_OUTPUT_FLAT = BLOCKS_TO_PICK * BOARD_FLAT
+NEURAL_PENALTY = -100
 
 def _get_valid_placement_mask(board: np.ndarray, idx: int) -> np.ndarray:
     block = BLOCKS[idx]
@@ -97,9 +98,11 @@ def decode_action(action: int):
     return piece, x, y
 
 class RandomFactory:
-    def __init__(self, seed):
-        self._seed = seed
-        self._random = rand.Random(seed)
+    def __init__(self, seed = None):
+        if seed is None:
+            self._random = rand.Random()
+        else:
+            self._random = rand.Random(seed)
 
     def new_blocks(self):
         return self._random.choices(range(BLOCKS_SIZE), k=BLOCKS_TO_PICK)
@@ -123,7 +126,7 @@ class State:
         self._streak = False
     
     def in_board(self):
-        return self._board.copy()
+        return np.array(self._board.copy(),dtype=np.int8).reshape((1, BOARD_LEN, BOARD_LEN))
     
     def in_blocks(self):
         tmp = self._available.copy()
@@ -132,7 +135,7 @@ class State:
         return np.array(tmp, dtype=np.int8)
 
     def in_streak(self):
-        return self._streak
+        return np.array([self._streak], dtype=bool)
 
     def _calculate_strikes(self, block: list, x: int, y: int):
         streak = False
@@ -215,7 +218,9 @@ class State:
 
         # check if we are terminal state and return the mask of illegal moves
         mask = self.calculate_mask()
-        return rwrd, bool(not mask.any()), mask
+        if not mask.any():
+            rwrd += NEURAL_PENALTY
+        return [rwrd, bool(not mask.any()), mask]
 
     def copy(self):
         return copy.deepcopy(self)
