@@ -3,46 +3,55 @@ import blokudoku_lib as bl
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+
+class ResBlock(nn.Module):
+    def __init__(self, ch_in: int, ch_out: int, ker):
+        super().__init__()
+        self.conv1 = nn.Conv2d(in_channels=ch_in, out_channels=ch_out, 
+                               kernel_size=ker, padding='same')
+        self.conv2 = nn.Conv2d(in_channels=ch_out, out_channels=ch_out, 
+                               kernel_size=ker, padding='same')
+
+    def forward(self, x):
+        residual = x
+        out = F.relu(self.conv1(x))
+        out = self.conv2(out)
+        return F.relu(out + residual)
 
 class BL_DQN_Conv_Network(nn.Module):
     IN_CON_CHANNELS = 1
     OUT_GEN_CONV = 64
-    OUT_STR_CONV = 64
     OUT_SUM_CONV = 32
+    
     KER_LAT = (1, 9)
     KER_VER = (9, 1)
     KER_DEF = (3, 3)
+    
     def __init__(self):
         super().__init__()
-        conv_general = nn.Sequential(
+        stem = nn.Sequential(
             nn.Conv2d(self.IN_CON_CHANNELS, self.OUT_GEN_CONV, self.KER_DEF, padding='same'),
-            nn.BatchNorm2d(self.OUT_GEN_CONV),
-            nn.ReLU(),
-            nn.Conv2d(self.OUT_GEN_CONV, self.OUT_GEN_CONV, self.KER_DEF, padding='same'),
-            nn.BatchNorm2d(self.OUT_GEN_CONV),
-            nn.ReLU(),
+            nn.ReLU()
         )
-
+        conv_general = nn.Sequential(
+            ResBlock(self.OUT_GEN_CONV, self.OUT_GEN_CONV, self.KER_DEF),
+            ResBlock(self.OUT_GEN_CONV, self.OUT_GEN_CONV, self.KER_DEF)
+        )
         conv_striped = nn.Sequential(
-            nn.Conv2d(self.OUT_GEN_CONV, self.OUT_STR_CONV, self.KER_LAT, padding='same'),
-            nn.BatchNorm2d(self.OUT_STR_CONV),
-            nn.ReLU(),
-            nn.Conv2d(self.OUT_STR_CONV, self.OUT_STR_CONV, self.KER_VER, padding='same'),
-            nn.BatchNorm2d(self.OUT_STR_CONV),
-            nn.ReLU()
+            ResBlock(self.OUT_GEN_CONV, self.OUT_GEN_CONV, self.KER_LAT),
+            ResBlock(self.OUT_GEN_CONV, self.OUT_GEN_CONV, self.KER_VER)
         )
-
         conv_summary = nn.Sequential(
-            nn.Conv2d(self.OUT_STR_CONV, self.OUT_SUM_CONV, self.KER_DEF, padding='same'),
-            nn.BatchNorm2d(self.OUT_SUM_CONV),
-            nn.ReLU()
+            nn.Conv2d(self.OUT_GEN_CONV, self.OUT_SUM_CONV, self.KER_DEF, padding='same'),
+            nn.ReLU(),
+            nn.Flatten()
         )
-
         self.conv_net = nn.Sequential(
+            stem,
             conv_general,
             conv_striped,
-            conv_summary,
-            nn.Flatten()
+            conv_summary
         )
 
     def forward(self, x):
@@ -111,9 +120,9 @@ class BL_DQN_Action_Network_v1(nn.Module):
                 score += rwrd
             scores.append(score - bl.NEURAL_PENALTY)
 
-        return f"Points in val games: {scores}, mean: {np.mean(scores):.2f}, std: {np.std(scores):.2f}"   
+        return f"Points in val games: {scores}, mean: {np.mean(scores):.2f}, std: {np.std(scores):.2f}"
 
-class BL_DQN_State_Network_v1(nn.Module):
+class BL_DQN_State_Network(nn.Module):
     STR_DENSE_DIM = 16
     OUT_EMBED_DIM = 16
 
@@ -138,7 +147,6 @@ class BL_DQN_State_Network_v1(nn.Module):
             nn.ReLU(),
             nn.Linear(self.HID_LIN_DIM, self.HID_LIN_DIM),
             nn.ReLU(),
-            nn.Linear(self.HID_LIN_DIM, 1),
         )
 
     def forward(self, board: torch.Tensor, blocks: torch.Tensor, streak: torch.Tensor):
@@ -149,6 +157,16 @@ class BL_DQN_State_Network_v1(nn.Module):
         final_input = torch.cat((board_out, blocks_out, streak_out), dim=1)
         return self.afterwards_net(final_input)
 
+class BL_DQN_State_Network_v1(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.network = BL_DQN_State_Network()
+        self.final = nn.Linear(BL_DQN_State_Network.HID_LIN_DIM, 1)
+
+    def forward(self, board: torch.Tensor, blocks: torch.Tensor, streak: torch.Tensor):
+        x = self.network(board, blocks, streak)
+        return self.final(x)
+
     def validate_model(self, num_games: int = 1):
         scores = []
         for _ in range(num_games):
@@ -157,7 +175,7 @@ class BL_DQN_State_Network_v1(nn.Module):
             game_over = False
             score = 0
             while not game_over:
-                actions, rewards, boards, blocks, streaks = cur_state.all_1move_states(mask)
+                actions, rewards, _, boards, blocks, streaks = cur_state.all_1move_states(mask)
 
                 nn_board = torch.Tensor(boards).float()
                 nn_blocks = torch.Tensor(blocks).long()
@@ -175,9 +193,49 @@ class BL_DQN_State_Network_v1(nn.Module):
                 score += int(rwrd)
 
             scores.append(score - bl.NEURAL_PENALTY)
-        return f"Points in val games: {scores}, mean: {np.mean(scores):.2f}, std: {np.std(scores):.2f}" 
+        return scores
 
+class BL_DQN_State_Network_v2(nn.Module):
+    def __init__(self, num_aux_features: int = 4):
+        super().__init__()
+        self.network = BL_DQN_State_Network()
+        self.value_head = nn.Linear(BL_DQN_State_Network.HID_LIN_DIM, 1)
+        self.aux_head = nn.Linear(BL_DQN_State_Network.HID_LIN_DIM, num_aux_features)
 
+    def forward(self, board: torch.Tensor, blocks: torch.Tensor, streak: torch.Tensor):
+        x = self.network(board, blocks, streak)
+        v_value = self.value_head(x)
+        aux_features = self.aux_head(x)
+        
+        return v_value, aux_features
+
+    def validate_model(self, num_games: int = 1):
+        scores = []
+        for _ in range(num_games):
+            cur_state = bl.State()
+            mask = cur_state.calculate_mask()
+            game_over = False
+            score = 0
+            while not game_over:
+                actions, rewards, _, boards, blocks, streaks = cur_state.all_1move_states(mask)
+
+                nn_board = torch.Tensor(boards).float()
+                nn_blocks = torch.Tensor(blocks).long()
+                nn_streak = torch.Tensor(streaks).float().view(-1, 1)
+                
+                with torch.no_grad():
+                    v_values, _ = self.forward(nn_board, nn_blocks, nn_streak)
+                    y_hat_nn = v_values.squeeze(1) + torch.from_numpy(rewards).float()
+
+                best_idx = int(torch.argmax(y_hat_nn))
+                best_action_encoded = actions[best_idx]
+                
+                piece, x, y = bl.State.decode_action(best_action_encoded)
+                rwrd, game_over, mask = cur_state.transition(piece, x, y)
+                score += int(rwrd)
+
+            scores.append(score - bl.NEURAL_PENALTY)
+        return scores
 
 class ActionsStorage:
     TOTAL_SIZE = 1_000_000

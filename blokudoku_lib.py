@@ -194,7 +194,7 @@ class State:
             raise ValueError(f"_count value: {self._count} is not in range 1-3!")
         return mask.reshape(NN_OUTPUT_FLAT)
 
-    def _transition_key(self, piece: int, x: int, y: int):
+    def transition_key(self, piece: int, x: int, y: int):
         block_id = self._available[piece]
         block = BLOCKS[block_id]
 
@@ -217,7 +217,7 @@ class State:
         return rwrd
 
     def transition(self, piece: int, x: int, y: int):
-        rwrd = self._transition_key(piece, x, y)
+        rwrd = self.transition_key(piece, x, y)
         mask = self.calculate_mask()
         if not mask.any():
             rwrd += NEURAL_PENALTY
@@ -228,6 +228,7 @@ class State:
         n_moves = len(actions)
 
         rewards = np.empty(n_moves, dtype=np.int16)
+        terminals = np.empty(n_moves, dtype=bool)
         out_boards = np.empty((n_moves, 1, BOARD_LEN, BOARD_LEN), dtype=bool)
         out_blocks = np.empty((n_moves, BLOCKS_TO_PICK), dtype=np.int8)
         out_streaks = np.empty((n_moves, 1), dtype=bool)
@@ -235,12 +236,12 @@ class State:
         for i, a in enumerate(actions):
             piece, x, y = State.decode_action(a)
             new_state = self.copy()
-            rewards[i] = new_state.transition(piece, x, y)[0]
+            rewards[i], terminals[i], _ = new_state.transition(piece, x, y)
             out_boards[i] = new_state.in_board()
             out_blocks[i] = new_state.in_blocks()
             out_streaks[i] = new_state.in_streak()
 
-        return actions, rewards, out_boards, out_blocks, out_streaks
+        return actions, rewards, terminals, out_boards, out_blocks, out_streaks
 
     def copy(self):
         new_st = object.__new__(self.__class__)
