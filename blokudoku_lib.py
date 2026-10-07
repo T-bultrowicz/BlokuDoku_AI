@@ -63,41 +63,15 @@ BLOCKS = [
 BLOCKS_SIZE = len(BLOCKS)
 EMPTY_SLOT = len(BLOCKS)
 BLOCKS_TO_PICK = 3
-
 BOARD_FLAT = 81
 BOARD_LEN = 9
 BOARD_SIZE = (9, 9)
-
-RANDOM_SEED = 13579
-
-NN_OUTPUT_3D = (BLOCKS_TO_PICK, BOARD_LEN, BOARD_LEN)
 NN_OUTPUT_FLAT = BLOCKS_TO_PICK * BOARD_FLAT
-NEURAL_PENALTY = -100
-
-def _get_valid_placement_mask(board: np.ndarray, idx: int) -> np.ndarray:
-    block = BLOCKS[idx]
-    valid_mask = np.ones(BOARD_SIZE, dtype=bool)
-    n = BOARD_LEN
-
-    for dx, dy in block:
-        invalid_positions = board[max(0, dx):min(n, n + dx), 
-                                  max(0, dy):min(n, n + dy)]
-
-        current_valid = np.zeros(BOARD_SIZE, dtype=bool)
-        current_valid[max(0, -dx):min(n, n - dx), 
-                      max(0, -dy):min(n, n - dy)] = ~invalid_positions
-        valid_mask &= current_valid
-
-    return valid_mask
-
-def decode_action(action: int):
-    piece = action // BOARD_FLAT
-    pos = action % BOARD_FLAT
-    x = pos // BOARD_LEN
-    y = pos % BOARD_LEN
-    return piece, x, y
+NEURAL_PENALTY = -50
 
 class RandomFactory:
+    DEF_SEED = 13579
+
     def __init__(self, seed = None):
         if seed is None:
             self._random = rand.Random()
@@ -110,13 +84,13 @@ class RandomFactory:
     def sample(self, list, k: int = 1):
         return self._random.sample(list, k)
 
-    def choice(self, list) -> int:
+    def choice(self, list):
         return self._random.choice(list)
 
     def explore_now(self, eps: float=0.0):
         return self._random.random() < eps
 
-rng_fact_instance = RandomFactory(RANDOM_SEED)
+rng_fact_instance = RandomFactory(RandomFactory.DEF_SEED)
 
 class State:
     def __init__(self):
@@ -126,7 +100,7 @@ class State:
         self._streak = False
     
     def in_board(self):
-        return np.array(self._board.copy(),dtype=np.int8).reshape((1, BOARD_LEN, BOARD_LEN))
+        return np.array(self._board.copy(),dtype=bool).reshape((1, BOARD_LEN, BOARD_LEN))
     
     def in_blocks(self):
         tmp = self._available.copy()
@@ -136,6 +110,31 @@ class State:
 
     def in_streak(self):
         return np.array([self._streak], dtype=bool)
+
+    @staticmethod
+    def decode_action(action: int):
+        piece = action // BOARD_FLAT
+        pos = action % BOARD_FLAT
+        x = pos // BOARD_LEN
+        y = pos % BOARD_LEN
+        return piece, x, y
+
+    @staticmethod
+    def _get_valid_mask(board: np.ndarray, idx: int) -> np.ndarray:
+        block = BLOCKS[idx]
+        valid_mask = np.ones(BOARD_SIZE, dtype=bool)
+        n = BOARD_LEN
+
+        for dx, dy in block:
+            invalid_positions = board[max(0, dx):min(n, n + dx), 
+                                    max(0, dy):min(n, n + dy)]
+
+            current_valid = np.zeros(BOARD_SIZE, dtype=bool)
+            current_valid[max(0, -dx):min(n, n - dx), 
+                        max(0, -dy):min(n, n - dy)] = ~invalid_positions
+            valid_mask &= current_valid
+
+        return valid_mask
 
     def _calculate_strikes(self, block: list, x: int, y: int):
         streak = False
@@ -179,24 +178,23 @@ class State:
         return rwrd, streak
 
     def calculate_mask(self):
-        mask = np.zeros(NN_OUTPUT_3D, bool)
-        mask[0, :, :] = _get_valid_placement_mask(self._board, self._available[0])
+        mask = np.zeros((BLOCKS_TO_PICK, BOARD_LEN, BOARD_LEN), bool)
+        mask[0, :, :] = self._get_valid_mask(self._board, self._available[0])
 
         if self._count == 1:
             mask[1, :, :] = False
             mask[2, :, :] = False
         elif self._count == 2:
-            mask[1, :, :] = _get_valid_placement_mask(self._board, self._available[1])
+            mask[1, :, :] = self._get_valid_mask(self._board, self._available[1])
             mask[2, :, :] = False
         elif self._count == 3:
-            mask[1, :, :] = _get_valid_placement_mask(self._board, self._available[1])
-            mask[2, :, :] = _get_valid_placement_mask(self._board, self._available[2])
+            mask[1, :, :] = self._get_valid_mask(self._board, self._available[1])
+            mask[2, :, :] = self._get_valid_mask(self._board, self._available[2])
         else:
             raise ValueError(f"_count value: {self._count} is not in range 1-3!")
-
         return mask.reshape(NN_OUTPUT_FLAT)
 
-    def transition(self, piece: int, x: int, y: int):
+    def _transition_key(self, piece: int, x: int, y: int):
         block_id = self._available[piece]
         block = BLOCKS[block_id]
 
@@ -216,14 +214,41 @@ class State:
             self._available = rng_fact_instance.new_blocks()
             self._count = BLOCKS_TO_PICK
 
-        # check if we are terminal state and return the mask of illegal moves
+        return rwrd
+
+    def transition(self, piece: int, x: int, y: int):
+        rwrd = self._transition_key(piece, x, y)
         mask = self.calculate_mask()
         if not mask.any():
             rwrd += NEURAL_PENALTY
         return [rwrd, bool(not mask.any()), mask]
 
+    def all_1move_states(self, mask: np.ndarray):
+        actions = np.flatnonzero(mask).astype(int)
+        n_moves = len(actions)
+
+        rewards = np.empty(n_moves, dtype=np.int16)
+        out_boards = np.empty((n_moves, 1, BOARD_LEN, BOARD_LEN), dtype=bool)
+        out_blocks = np.empty((n_moves, BLOCKS_TO_PICK), dtype=np.int8)
+        out_streaks = np.empty((n_moves, 1), dtype=bool)
+
+        for i, a in enumerate(actions):
+            piece, x, y = State.decode_action(a)
+            new_state = self.copy()
+            rewards[i] = new_state.transition(piece, x, y)[0]
+            out_boards[i] = new_state.in_board()
+            out_blocks[i] = new_state.in_blocks()
+            out_streaks[i] = new_state.in_streak()
+
+        return actions, rewards, out_boards, out_blocks, out_streaks
+
     def copy(self):
-        return copy.deepcopy(self)
+        new_st = object.__new__(self.__class__)
+        new_st._board = self._board.copy()
+        new_st._count = self._count
+        new_st._available = self._available.copy()
+        new_st._streak = self._streak
+        return new_st
 
 if __name__ == "__main__":
     # x = State()
