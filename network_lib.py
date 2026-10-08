@@ -167,36 +167,8 @@ class BL_DQN_State_Network_v1(nn.Module):
         x = self.network(board, blocks, streak)
         return self.final(x)
 
-    def validate_model(self, num_games: int = 1):
-        scores = []
-        for _ in range(num_games):
-            cur_state = bl.State()
-            mask = cur_state.calculate_mask()
-            game_over = False
-            score = 0
-            while not game_over:
-                actions, rewards, _, boards, blocks, streaks = cur_state.all_1move_states(mask)
-
-                nn_board = torch.Tensor(boards).float()
-                nn_blocks = torch.Tensor(blocks).long()
-                nn_streak = torch.Tensor(streaks).float().view(-1, 1)
-                
-                with torch.no_grad():
-                    y_hat_nn = self.forward(nn_board, nn_blocks, nn_streak).squeeze(1)
-
-                t_rewards = torch.from_numpy(rewards).float()
-                best_idx = int(torch.argmax(y_hat_nn + t_rewards))
-                best_action_encoded = actions[best_idx]
-                
-                piece, x, y = bl.State.decode_action(best_action_encoded)
-                rwrd, game_over, mask = cur_state.transition(piece, x, y)
-                score += int(rwrd)
-
-            scores.append(score - bl.NEURAL_PENALTY)
-        return scores
-
 class BL_DQN_State_Network_v2(nn.Module):
-    def __init__(self, num_aux_features: int = 4):
+    def __init__(self, num_aux_features: int = 0):
         super().__init__()
         self.network = BL_DQN_State_Network()
         self.value_head = nn.Linear(BL_DQN_State_Network.HID_LIN_DIM, 1)
@@ -208,34 +180,6 @@ class BL_DQN_State_Network_v2(nn.Module):
         aux_features = self.aux_head(x)
         
         return v_value, aux_features
-
-    def validate_model(self, num_games: int = 1):
-        scores = []
-        for _ in range(num_games):
-            cur_state = bl.State()
-            mask = cur_state.calculate_mask()
-            game_over = False
-            score = 0
-            while not game_over:
-                actions, rewards, _, boards, blocks, streaks = cur_state.all_1move_states(mask)
-
-                nn_board = torch.Tensor(boards).float()
-                nn_blocks = torch.Tensor(blocks).long()
-                nn_streak = torch.Tensor(streaks).float().view(-1, 1)
-                
-                with torch.no_grad():
-                    v_values, _ = self.forward(nn_board, nn_blocks, nn_streak)
-                    y_hat_nn = v_values.squeeze(1) + torch.from_numpy(rewards).float()
-
-                best_idx = int(torch.argmax(y_hat_nn))
-                best_action_encoded = actions[best_idx]
-                
-                piece, x, y = bl.State.decode_action(best_action_encoded)
-                rwrd, game_over, mask = cur_state.transition(piece, x, y)
-                score += int(rwrd)
-
-            scores.append(score - bl.NEURAL_PENALTY)
-        return scores
 
 class ActionsStorage:
     TOTAL_SIZE = 1_000_000
@@ -366,3 +310,54 @@ class StateStorage:
             self.rewards[idx],
             self.terminal[idx],
         )
+
+class SmartStateStorage:
+    EMPTY_BOARDS_MAX = 16
+    CASUAL_BOARDS_MAX = 32
+    CROWDED_BOARDS_MAX = 48
+
+    def __init__(self):
+        self.empty_boards = StateStorage()
+        self.casual_boards = StateStorage()
+        self.crowded_boards = StateStorage()
+        self.ultra_crowded_boards = StateStorage()
+
+    @property
+    def size(self):
+        return min(self.empty_boards.size, 
+                   self.casual_boards.size, 
+                   self.crowded_boards.size, 
+                   self.ultra_crowded_boards.size)
+
+    def add_records(self, boards_s: np.ndarray, blocks_s: np.ndarray, streaks_s: np.ndarray,
+                          boards_f: np.ndarray, blocks_f: np.ndarray, streaks_f: np.ndarray,
+                          rewards: np.ndarray, terminals: np.ndarray):
+        board_counts = np.sum(boards_s.reshape(len(boards_s), -1), axis=1)
+        empty_mask = board_counts <= self.EMPTY_BOARDS_MAX
+        casual_mask = (board_counts > self.EMPTY_BOARDS_MAX) & (board_counts <= self.CASUAL_BOARDS_MAX)
+        crowded_mask = (board_counts > self.CASUAL_BOARDS_MAX) & (board_counts <= self.CROWDED_BOARDS_MAX) 
+        ultra_crowded_mask = board_counts > self.CROWDED_BOARDS_MAX
+
+        def push(storage_obj, mask):
+            if np.any(mask):
+                storage_obj.add_records(
+                    boards_s[mask], blocks_s[mask], streaks_s[mask],
+                    boards_f[mask], blocks_f[mask], streaks_f[mask],
+                    rewards[mask], terminals[mask]
+                )
+        push(self.empty_boards, empty_mask)
+        push(self.casual_boards, casual_mask)
+        push(self.crowded_boards, crowded_mask)
+        push(self.ultra_crowded_boards, ultra_crowded_mask)
+
+    def sample(self, num_samples: int = 1):
+        each_sample = num_samples // 4
+
+        s1 = self.empty_boards.sample(each_sample)
+        s2 = self.casual_boards.sample(each_sample)
+        s3 = self.crowded_boards.sample(each_sample)
+        s4 = self.ultra_crowded_boards.sample(num_samples - 3 * each_sample)
+        combined_data = tuple (
+            np.concatenate(arrays, axis=0) for arrays in zip(s1, s2, s3, s4)
+        )
+        return combined_data
