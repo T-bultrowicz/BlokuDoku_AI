@@ -12,9 +12,10 @@ import torch.nn.functional as F
 import copy
 
 # LONGEVITY OF TRAINING AND VALIDATION INTERVAL PARAMETERS
-GAMES_TO_PLAY = 65_000
+GAMES_TO_PLAY = 60_000
 GAMES_IN_PARALLEL = 16
 EXCHANGE_NETS_FREQ = 250
+DISPLAY_ERR_FREQ = 250
 GAMES_TO_DISPLAY_INFO = 250
 VALIDATION_GAMES_PER_BATCH = 5
 VALIDATION_GAMES_PER_FIGHT = 25
@@ -24,12 +25,13 @@ EPS_MAX = 1.0
 EPS_MIN = 0.025
 DECAY_RATE = 0.999995
 DISCOUNT = 0.999
-BATCH_SIZE = 128
+BATCH_SIZE = 64
 LEARING_OPTIM_RATE = 1e-4
 
 # ADVANCED OPTIONS
 MARGIN = 50.0
 SIDE_TASK_WEIGHT = 1.0
+EPS_THRESHOLD = 0.15
 
 def try_write_best_net(netw: nn.Module, 
                        filepath_net: str, 
@@ -278,7 +280,7 @@ class StateNetworkTrainer:
     def _get_components(cls):
         return net.BL_DQN_State_Network_v1(), \
                net.BL_DQN_State_Network_v1(), \
-               net.SmartStateStorage()
+               net.StateStorage()
 
     @classmethod
     def _gather_data(cls, states: list, masks: list):
@@ -327,7 +329,7 @@ class StateNetworkTrainer:
 
     @classmethod
     def _env_update(cls, states: list, masks: list, chosen_actions: np.ndarray, 
-                    storage: net.SmartStateStorage, all_actions: list):
+                    storage, all_actions: list):
         n = chosen_actions.shape[0]
         boards_s = np.array([st.in_board() for st in states])
         blocks_s = np.array([st.in_blocks() for st in states])
@@ -359,8 +361,8 @@ class StateNetworkTrainer:
     @classmethod
     def _perform_gradient_descent(cls, main_net: nn.Module, 
                                   target_net: nn.Module,
-                                  storage: net.SmartStateStorage,
-                                  optimizer: torch.optim.Adam):
+                                  storage,
+                                  optimizer: torch.optim.Adam, display_err: bool = False):
         if storage.size < BATCH_SIZE:
             return
 
@@ -404,6 +406,8 @@ class StateNetworkTrainer:
 
         score, score_std = val_state_net(main_net, VALIDATION_GAMES_PER_BATCH)
         print(f"Points in val games - mean: {score:.2f}, std: {score_std:.2f}")
+        print()
+
         try_write_best_net(main_net, cls.SAVE_PATH_NET, 
             cls.SAVE_PATH_SCORE, VALIDATION_GAMES_PER_FIGHT, score)
         return games_mod % GAMES_TO_DISPLAY_INFO, time.perf_counter()
@@ -434,7 +438,8 @@ class StateNetworkTrainer:
             states, masks, term_sum = cls._env_update(states, masks, 
                     chosen_actions, storage, a_actions)
 
-            cls._perform_gradient_descent(main_net, target_net, storage, optimizer)
+            cls._perform_gradient_descent(main_net, target_net, storage, 
+                                          optimizer, loops % DISPLAY_ERR_FREQ == 0)
 
             loops += 1
             games_played += term_sum
@@ -443,6 +448,26 @@ class StateNetworkTrainer:
             games_played_mod, batch_start_time = cls._display_info(
                 games_played, games_played_mod, batch_start_time, eps, main_net
             )
+
+            # SWITCH TO STRATIFIED STORAGE
+            if eps < EPS_THRESHOLD and not isinstance(storage, net.SmartStateStorage):
+                print(f"Epsilon fell below {EPS_THRESHOLD}. Switching to smart state storage. ")
+                old_storage = storage
+                storage = net.SmartStateStorage()
+                sz = old_storage.size
+                storage.add_records(
+                    old_storage.boards_s[:sz],
+                    old_storage.blocks_s[:sz],
+                    old_storage.streaks_s[:sz],
+                    old_storage.boards_f[:sz],
+                    old_storage.blocks_f[:sz],
+                    old_storage.streaks_f[:sz],
+                    old_storage.rewards[:sz],
+                    old_storage.terminal[:sz]
+                )
+                
+                print(f"Transfer finished!\n")
+                del old_storage
 
             # EXCHANGE NETWORKS
             if loops % EXCHANGE_NETS_FREQ == 0:
@@ -457,7 +482,7 @@ class AdvancedTrainer(StateNetworkTrainer):
     def _get_components(cls): # type: ignore
         return net.BL_DQN_State_Network_v2(num_aux_features=cls.NUM_AUX), \
                net.BL_DQN_State_Network_v2(num_aux_features=cls.NUM_AUX), \
-               net.SmartStateStorage()
+               net.StateStorage()
 
     @classmethod
     def _calculate_aux_targets(cls, boards_tensor: torch.Tensor):
@@ -488,7 +513,7 @@ class AdvancedTrainer(StateNetworkTrainer):
         return torch.stack([f1, f2, f3, f4, f5], dim=1)
     
     @classmethod
-    def _perform_gradient_descent(cls, main_net, target_net, storage, optimizer):
+    def _perform_gradient_descent(cls, main_net, target_net, storage, optimizer, display_err: bool = False):
         if storage.size < BATCH_SIZE:
             return
 
@@ -521,6 +546,9 @@ class AdvancedTrainer(StateNetworkTrainer):
         target_aux = cls._calculate_aux_targets(nn_brd_s) 
         loss_aux = F.mse_loss(aux_pred, target_aux)
 
+        if display_err:
+            print(f"Loss V: {torch.mean(loss_v):.4f}, Loss Aux: {torch.mean(loss_aux):.4f}")
+
         total_loss = loss_v + SIDE_TASK_WEIGHT * loss_aux
         optimizer.zero_grad()
         total_loss.backward()
@@ -532,9 +560,9 @@ def main(args):
        return 0
 
     if args[1] == "train":
-        ActionNetworkTrainer.train_action_network()
+        # ActionNetworkTrainer.train_action_network()
         # StateNetworkTrainer.train_state_network()
-        # AdvancedTrainer.train_state_network()
+        AdvancedTrainer.train_state_network()
 
     elif args[1] == "test":
         raise RuntimeError("Not implemented yet!")

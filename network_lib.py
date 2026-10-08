@@ -351,12 +351,13 @@ class SmartStateStorage:
         push(self.ultra_crowded_boards, ultra_crowded_mask)
 
     def sample(self, num_samples: int = 1):
-        each_sample = num_samples // 4
+        total_parts = 8
+        samples = [i * num_samples // total_parts for i in [1, 3, 3]]
 
-        s1 = self.empty_boards.sample(each_sample)
-        s2 = self.casual_boards.sample(each_sample)
-        s3 = self.crowded_boards.sample(each_sample)
-        s4 = self.ultra_crowded_boards.sample(num_samples - 3 * each_sample)
+        s1 = self.empty_boards.sample(samples[0])
+        s2 = self.casual_boards.sample(samples[1])
+        s3 = self.crowded_boards.sample(samples[2])
+        s4 = self.ultra_crowded_boards.sample(num_samples - sum(samples))
         combined_data = tuple (
             np.concatenate(arrays, axis=0) for arrays in zip(s1, s2, s3, s4)
         )
