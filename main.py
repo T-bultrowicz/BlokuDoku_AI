@@ -15,22 +15,22 @@ import copy
 GAMES_TO_PLAY = 60_000
 GAMES_IN_PARALLEL = 16
 EXCHANGE_NETS_FREQ = 250
-DISPLAY_ERR_FREQ = 250
+DISPLAY_ERR_FREQ = 1500
 GAMES_TO_DISPLAY_INFO = 250
 VALIDATION_GAMES_PER_BATCH = 5
 VALIDATION_GAMES_PER_FIGHT = 25
 
 # BASIC LEARING HYPERPARAMETERS
 EPS_MAX = 1.0
-EPS_MIN = 0.025
+EPS_MIN = 0.005
 DECAY_RATE = 0.999995
 DISCOUNT = 0.999
-BATCH_SIZE = 64
+BATCH_SIZE = 128
 LEARING_OPTIM_RATE = 1e-4
 
 # ADVANCED OPTIONS
 MARGIN = 50.0
-SIDE_TASK_WEIGHT = 1.0
+SIDE_TASK_WEIGHT = 7.0
 EPS_THRESHOLD = 0.15
 
 def try_write_best_net(netw: nn.Module, 
@@ -118,6 +118,33 @@ def val_state_net(netw: nn.Module, games_count: int = 100):
         scores.append(score - bl.NEURAL_PENALTY)
     netw.train()
     return np.mean(scores), np.std(scores)
+
+def calculate_aux_targets(boards_tensor: torch.Tensor):
+    b = boards_tensor.squeeze(1).bool()
+    
+    # 1. Taken fileds
+    f1 = b.sum(dim=(1, 2)) 
+    # 2. Non empty columns (normalized 0-1)
+    f2 = (b.sum(dim=1) > 0).float().sum(dim=1)
+    # 3. Non empty rows (normalized 0-1)
+    f3 = (b.sum(dim=2) > 0).float().sum(dim=1)
+    # 4. Non empty 3x3 blocks (normalized 0-1)
+    f4 = torch.stack([
+        b[:, i:i+3, j:j+3].sum(dim=(1, 2)) > 0
+        for i in range(0, 9, 3) for j in range(0, 9, 3)
+    ], dim=1).sum(dim=1)
+    # 5. Holes in the board (normalized 0 - 1)
+    tmp = torch.ones_like(b)
+    # So tmp contains only fields surrounded by True fields.
+    tmp[:, :, 1:] &= b[:, :, :-1]
+    tmp[:, 1:, :] &= b[:, :-1, :]
+    tmp[:, :, :-1] &= b[:, :, 1:]
+    tmp[:, :-1, :] &= b[:, 1:, :]
+    # Now every empty field, but surrounded, is a hole.
+    holes = (~b) & tmp
+    f5 = holes.sum(dim=(1, 2)).float()
+    
+    return torch.stack([f1, f2, f3, f4, f5], dim=1)
 
 def _randomise(mask: np.ndarray):
     valid_actions = np.flatnonzero(mask)
@@ -278,8 +305,8 @@ class StateNetworkTrainer:
 
     @classmethod
     def _get_components(cls):
-        return net.BL_DQN_State_Network_v1(), \
-               net.BL_DQN_State_Network_v1(), \
+        return net.BL_DQN_State_Network_v1(net.BL_DQN_State_Network()), \
+               net.BL_DQN_State_Network_v1(net.BL_DQN_State_Network()), \
                net.StateStorage()
 
     @classmethod
@@ -449,26 +476,6 @@ class StateNetworkTrainer:
                 games_played, games_played_mod, batch_start_time, eps, main_net
             )
 
-            # SWITCH TO STRATIFIED STORAGE
-            if eps < EPS_THRESHOLD and not isinstance(storage, net.SmartStateStorage):
-                print(f"Epsilon fell below {EPS_THRESHOLD}. Switching to smart state storage. ")
-                old_storage = storage
-                storage = net.SmartStateStorage()
-                sz = old_storage.size
-                storage.add_records(
-                    old_storage.boards_s[:sz],
-                    old_storage.blocks_s[:sz],
-                    old_storage.streaks_s[:sz],
-                    old_storage.boards_f[:sz],
-                    old_storage.blocks_f[:sz],
-                    old_storage.streaks_f[:sz],
-                    old_storage.rewards[:sz],
-                    old_storage.terminal[:sz]
-                )
-                
-                print(f"Transfer finished!\n")
-                del old_storage
-
             # EXCHANGE NETWORKS
             if loops % EXCHANGE_NETS_FREQ == 0:
                 target_net.load_state_dict(main_net.state_dict())
@@ -480,37 +487,9 @@ class AdvancedTrainer(StateNetworkTrainer):
 
     @classmethod
     def _get_components(cls): # type: ignore
-        return net.BL_DQN_State_Network_v2(num_aux_features=cls.NUM_AUX), \
-               net.BL_DQN_State_Network_v2(num_aux_features=cls.NUM_AUX), \
-               net.StateStorage()
-
-    @classmethod
-    def _calculate_aux_targets(cls, boards_tensor: torch.Tensor):
-        b = boards_tensor.squeeze(1).bool()
-        
-        # 1. Taken fileds
-        f1 = b.sum(dim=(1, 2)) 
-        # 2. Non empty columns (normalized 0-1)
-        f2 = (b.sum(dim=1) > 0).float().sum(dim=1)
-        # 3. Non empty rows (normalized 0-1)
-        f3 = (b.sum(dim=2) > 0).float().sum(dim=1)
-        # 4. Non empty 3x3 blocks (normalized 0-1)
-        f4 = torch.stack([
-            b[:, i:i+3, j:j+3].sum(dim=(1, 2)) > 0
-            for i in range(0, 9, 3) for j in range(0, 9, 3)
-        ], dim=1).sum(dim=1)
-        # 5. Holes in the board (normalized 0 - 1)
-        tmp = torch.ones_like(b)
-        # So tmp contains only fields surrounded by True fields.
-        tmp[:, :, 1:] &= b[:, :, :-1]
-        tmp[:, 1:, :] &= b[:, :-1, :]
-        tmp[:, :, :-1] &= b[:, :, 1:]
-        tmp[:, :-1, :] &= b[:, 1:, :]
-        # Now every empty field, but surrounded, is a hole.
-        holes = (~b) & tmp
-        f5 = holes.sum(dim=(1, 2)).float()
-        
-        return torch.stack([f1, f2, f3, f4, f5], dim=1)
+        return net.BL_DQN_State_Network_v2(net.BL_DQN_State_Network(), cls.NUM_AUX), \
+               net.BL_DQN_State_Network_v2(net.BL_DQN_State_Network(), cls.NUM_AUX), \
+               net.SmartStateStorage()
     
     @classmethod
     def _perform_gradient_descent(cls, main_net, target_net, storage, optimizer, display_err: bool = False):
@@ -543,17 +522,35 @@ class AdvancedTrainer(StateNetworkTrainer):
         target_v = b_rewards + (1 - b_terminals) * DISCOUNT * v_next
         loss_v = F.smooth_l1_loss(v_pred, target_v)
 
-        target_aux = cls._calculate_aux_targets(nn_brd_s) 
+        target_aux = calculate_aux_targets(nn_brd_s) 
         loss_aux = F.mse_loss(aux_pred, target_aux)
-
-        if display_err:
-            print(f"Loss V: {torch.mean(loss_v):.4f}, Loss Aux: {torch.mean(loss_aux):.4f}")
 
         total_loss = loss_v + SIDE_TASK_WEIGHT * loss_aux
         optimizer.zero_grad()
         total_loss.backward()
         optimizer.step()
 
+class LightTrainer(StateNetworkTrainer):
+    SAVE_PATH_NET = "state_network_light.pt"
+    SAVE_PATH_SCORE = "best_score_light.txt"
+
+    @classmethod
+    def _get_components(cls): # type: ignore
+        return net.BL_DQN_State_Network_v1(net.BL_DQN_State_Network_Light()), \
+               net.BL_DQN_State_Network_v1(net.BL_DQN_State_Network_Light()), \
+               net.StateStorage()
+
+class HeavyTrainer(StateNetworkTrainer):
+    SAVE_PATH_NET = "state_network_heavy.pt"
+    SAVE_PATH_SCORE = "best_score_heavy.txt"
+
+    @classmethod
+    def _get_components(cls): # type: ignore
+        return net.BL_DQN_State_Network_v1(net.BL_DQN_State_Network_Heavy()), \
+               net.BL_DQN_State_Network_v1(net.BL_DQN_State_Network_Heavy()), \
+               net.StateStorage()
+
+# TODO - add options to switch between models for user, via console.
 def main(args):
     if len(args) != 2:
        print(f"Main needs one argument, but received: {len(args) - 1} arguments! Type './executable usage' for help!")
@@ -561,11 +558,18 @@ def main(args):
 
     if args[1] == "train":
         # ActionNetworkTrainer.train_action_network()
-        # StateNetworkTrainer.train_state_network()
-        AdvancedTrainer.train_state_network()
+        StateNetworkTrainer.train_state_network()
+        # AdvancedTrainer.train_state_network()
+        # LightTrainer.train_state_network()
+        # HeavyTrainer.train_state_network()
+        pass
 
     elif args[1] == "test":
-        raise RuntimeError("Not implemented yet!")
+        main_net = net.BL_DQN_State_Network_v1(net.BL_DQN_State_Network())
+        main_net.load_state_dict(torch.load(StateNetworkTrainer.SAVE_PATH_NET, weights_only=True))
+        score, score_std = val_state_net(main_net, 30)
+        print(f"Points in val games - mean: {score:.2f}, std: {score_std:.2f}")
+        pass
 
     elif args[1] == "play_as_player":
         user_play.play_as_player()

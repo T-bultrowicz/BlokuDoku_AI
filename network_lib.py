@@ -28,22 +28,24 @@ class BL_DQN_Conv_Network(nn.Module):
     KER_VER = (9, 1)
     KER_DEF = (3, 3)
     
-    def __init__(self):
+    def __init__(self, in_chan: int = IN_CON_CHANNELS, 
+                        out_gen: int = OUT_GEN_CONV, 
+                        out_sum: int = OUT_SUM_CONV):
         super().__init__()
         stem = nn.Sequential(
-            nn.Conv2d(self.IN_CON_CHANNELS, self.OUT_GEN_CONV, self.KER_DEF, padding='same'),
+            nn.Conv2d(in_chan, out_gen, self.KER_DEF, padding='same'),
             nn.ReLU()
         )
         conv_general = nn.Sequential(
-            ResBlock(self.OUT_GEN_CONV, self.OUT_GEN_CONV, self.KER_DEF),
-            ResBlock(self.OUT_GEN_CONV, self.OUT_GEN_CONV, self.KER_DEF)
+            ResBlock(out_gen, out_gen, self.KER_DEF),
+            ResBlock(out_gen, out_gen, self.KER_DEF)
         )
         conv_striped = nn.Sequential(
-            ResBlock(self.OUT_GEN_CONV, self.OUT_GEN_CONV, self.KER_LAT),
-            ResBlock(self.OUT_GEN_CONV, self.OUT_GEN_CONV, self.KER_VER)
+            ResBlock(out_gen, out_gen, self.KER_LAT),
+            ResBlock(out_gen, out_gen, self.KER_VER)
         )
         conv_summary = nn.Sequential(
-            nn.Conv2d(self.OUT_GEN_CONV, self.OUT_SUM_CONV, self.KER_DEF, padding='same'),
+            nn.Conv2d(out_gen, out_sum, self.KER_DEF, padding='same'),
             nn.ReLU(),
             nn.Flatten()
         )
@@ -56,6 +58,63 @@ class BL_DQN_Conv_Network(nn.Module):
 
     def forward(self, x):
         return self.conv_net(x)
+
+class BL_DQN_Conv_Network_Light(BL_DQN_Conv_Network):
+    IN_CON_CHANNELS = 1
+    OUT_GEN_CONV = 48
+    OUT_SUM_CONV = 24
+    
+    def __init__(self):
+        super().__init__(self.IN_CON_CHANNELS, self.OUT_GEN_CONV, self.OUT_SUM_CONV)
+
+    def forward(self, x):
+        super().forward(x)
+
+# For now the same as usual conv network.
+class BL_DQN_Conv_Network_Heavy(nn.Module):
+    IN_CON_CHANNELS = 1
+    OUT_GEN_CONV = 128
+    OUT_SUM_CONV = 64
+
+    KER_LAT = (1, 9)
+    KER_VER = (9, 1)
+    KER_DEF = (3, 3)
+
+    def __init__(self):
+        super().__init__()
+
+        in_chan = self.IN_CON_CHANNELS
+        out_gen = self.OUT_GEN_CONV
+        out_sum = self.OUT_SUM_CONV
+        stem = nn.Sequential(
+            nn.Conv2d(in_chan, out_gen, self.KER_DEF, padding='same'),
+            nn.ReLU()
+        )
+        conv_general = nn.Sequential(
+            ResBlock(out_gen, out_gen, self.KER_DEF),
+            ResBlock(out_gen, out_gen, self.KER_DEF)
+        )
+        conv_striped = nn.Sequential(
+            ResBlock(out_gen, out_gen, self.KER_LAT),
+            ResBlock(out_gen, out_gen, self.KER_VER),
+            ResBlock(out_gen, out_gen, self.KER_LAT),
+            ResBlock(out_gen, out_gen, self.KER_VER)
+        )
+        conv_summary = nn.Sequential(
+            nn.Conv2d(out_gen, out_sum, self.KER_DEF, padding='same'),
+            nn.ReLU(),
+            nn.Flatten()
+        )
+        self.conv_net = nn.Sequential(
+            stem,
+            conv_general,
+            conv_striped,
+            conv_summary
+        )
+
+    def forward(self, x):
+        return self.conv_net(x)
+    
 
 class BL_DQN_Action_Network_v1(nn.Module):
     STR_DENSE_DIM = 16
@@ -122,17 +181,17 @@ class BL_DQN_Action_Network_v1(nn.Module):
 
         return f"Points in val games: {scores}, mean: {np.mean(scores):.2f}, std: {np.std(scores):.2f}"
 
-class BL_DQN_State_Network(nn.Module):
+class BL_DQN_State_Network_Base(nn.Module):
     STR_DENSE_DIM = 16
     OUT_EMBED_DIM = 16
+    HID_LIN_DIM_1 = 384
+    HID_LIN_DIM_2 = 192
 
-    CONV_NET_OUT = BL_DQN_Conv_Network.OUT_SUM_CONV * bl.BOARD_FLAT
-    IN_LIN_DIM = CONV_NET_OUT + (OUT_EMBED_DIM * bl.BLOCKS_TO_PICK) + STR_DENSE_DIM
-    HID_LIN_DIM = 256
-
-    def __init__(self):
+    def __init__(self, conv_class, conv_out_channels, 
+                hid_dim_1: int = HID_LIN_DIM_1, hid_dim_2: int = HID_LIN_DIM_2):
         super().__init__()
-        self.conv_net = BL_DQN_Conv_Network()
+        self.conv_net = conv_class()
+        
         self.embed_net = nn.Sequential(
             nn.Embedding(bl.BLOCKS_SIZE + 1, self.OUT_EMBED_DIM),
             nn.Flatten()
@@ -142,10 +201,14 @@ class BL_DQN_State_Network(nn.Module):
             nn.ReLU()
         )
 
+        in_lin_dim = (conv_out_channels * bl.BOARD_FLAT) + \
+                     (self.OUT_EMBED_DIM * bl.BLOCKS_TO_PICK) + \
+                     self.STR_DENSE_DIM
+
         self.afterwards_net = nn.Sequential(
-            nn.Linear(self.IN_LIN_DIM, self.HID_LIN_DIM),
+            nn.Linear(in_lin_dim, hid_dim_1),
             nn.ReLU(),
-            nn.Linear(self.HID_LIN_DIM, self.HID_LIN_DIM),
+            nn.Linear(hid_dim_1, hid_dim_2),
             nn.ReLU(),
         )
 
@@ -157,22 +220,46 @@ class BL_DQN_State_Network(nn.Module):
         final_input = torch.cat((board_out, blocks_out, streak_out), dim=1)
         return self.afterwards_net(final_input)
 
-class BL_DQN_State_Network_v1(nn.Module):
+class BL_DQN_State_Network(BL_DQN_State_Network_Base):
     def __init__(self):
+        super().__init__(BL_DQN_Conv_Network, BL_DQN_Conv_Network.OUT_SUM_CONV)
+
+class BL_DQN_State_Network_Light(BL_DQN_State_Network_Base):
+    STR_DENSE_DIM = 8
+    HID_LIN_DIM_1 = 256
+    HID_LIN_DIM_2 = 32
+
+    def __init__(self):
+        super().__init__(BL_DQN_Conv_Network_Light, BL_DQN_Conv_Network_Light.OUT_SUM_CONV, 
+                    self.HID_LIN_DIM_1, self.HID_LIN_DIM_2)
+
+class BL_DQN_State_Network_Heavy(BL_DQN_State_Network_Base):
+    HID_LIN_DIM_1 = 256
+    HID_LIN_DIM_2 = 256
+
+    def __init__(self):
+        super().__init__(BL_DQN_Conv_Network_Heavy, BL_DQN_Conv_Network_Heavy.OUT_SUM_CONV,
+                    self.HID_LIN_DIM_1, self.HID_LIN_DIM_2)
+
+class BL_DQN_State_Network_v1(nn.Module):
+    def __init__(self, 
+    base_network: BL_DQN_State_Network | BL_DQN_State_Network_Light | BL_DQN_State_Network_Heavy):
         super().__init__()
-        self.network = BL_DQN_State_Network()
-        self.final = nn.Linear(BL_DQN_State_Network.HID_LIN_DIM, 1)
+        self.network = base_network
+        self.final = nn.Linear(base_network.HID_LIN_DIM_2, 1)
 
     def forward(self, board: torch.Tensor, blocks: torch.Tensor, streak: torch.Tensor):
         x = self.network(board, blocks, streak)
         return self.final(x)
 
-class BL_DQN_State_Network_v2(nn.Module):
-    def __init__(self, num_aux_features: int = 0):
+class BL_DQN_State_Network_v2(nn.Module): 
+    def __init__(self, 
+                base_network: BL_DQN_State_Network | BL_DQN_State_Network_Light | BL_DQN_State_Network_Heavy,
+                num_aux_features: int = 0):
         super().__init__()
-        self.network = BL_DQN_State_Network()
-        self.value_head = nn.Linear(BL_DQN_State_Network.HID_LIN_DIM, 1)
-        self.aux_head = nn.Linear(BL_DQN_State_Network.HID_LIN_DIM, num_aux_features)
+        self.network = base_network
+        self.value_head = nn.Linear(base_network.HID_LIN_DIM_2, 1)
+        self.aux_head = nn.Linear(base_network.HID_LIN_DIM_2, num_aux_features)
 
     def forward(self, board: torch.Tensor, blocks: torch.Tensor, streak: torch.Tensor):
         x = self.network(board, blocks, streak)
@@ -351,13 +438,12 @@ class SmartStateStorage:
         push(self.ultra_crowded_boards, ultra_crowded_mask)
 
     def sample(self, num_samples: int = 1):
-        total_parts = 8
-        samples = [i * num_samples // total_parts for i in [1, 3, 3]]
+        part = 5 * num_samples // 16
 
-        s1 = self.empty_boards.sample(samples[0])
-        s2 = self.casual_boards.sample(samples[1])
-        s3 = self.crowded_boards.sample(samples[2])
-        s4 = self.ultra_crowded_boards.sample(num_samples - sum(samples))
+        s1 = self.empty_boards.sample(part)
+        s2 = self.casual_boards.sample(part)
+        s3 = self.crowded_boards.sample(part)
+        s4 = self.ultra_crowded_boards.sample(num_samples - 3 * part)
         combined_data = tuple (
             np.concatenate(arrays, axis=0) for arrays in zip(s1, s2, s3, s4)
         )
