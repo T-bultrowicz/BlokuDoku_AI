@@ -32,6 +32,8 @@ LEARING_OPTIM_RATE = 1e-4
 MARGIN = 50.0
 SIDE_TASK_WEIGHT = 7.0
 EPS_THRESHOLD = 0.15
+STEP_TO_MODIFY = 15000
+GAMMA = 0.5
 
 def try_write_best_net(netw: nn.Module, 
                        filepath_net: str, 
@@ -40,7 +42,7 @@ def try_write_best_net(netw: nn.Module,
                        netw_res: float = 0.0):
     if not os.path.exists(filepath_score) or not os.path.exists(filepath_net):
         torch.save(netw.state_dict(), filepath_net)
-        current_score, _ = val_state_net(netw, val_games_num)
+        current_score, _ = val_state_net(netw, val_games_num) # type: ignore
         
         with open(filepath_score, "w") as f:
             f.write(str(current_score)) 
@@ -65,7 +67,7 @@ def try_write_best_net(netw: nn.Module,
 
     if not load_success:
         torch.save(netw.state_dict(), filepath_net)
-        current_score, _ = val_state_net(netw, val_games_num)
+        current_score, _ = val_state_net(netw, val_games_num) # type: ignore
         
         with open(filepath_score, "w") as f:
             f.write(str(current_score))
@@ -73,8 +75,8 @@ def try_write_best_net(netw: nn.Module,
         return
 
     print(f"\nStarting game validation - two agent fight ...")
-    current_score, _ = val_state_net(netw, val_games_num)
-    saved_score, _ = val_state_net(saved_net, val_games_num)
+    current_score, _ = val_state_net(netw, val_games_num) # type: ignore
+    saved_score, _ = val_state_net(saved_net, val_games_num) # type: ignore
 
     # Kto wygrał?
     if current_score > saved_score:
@@ -87,7 +89,7 @@ def try_write_best_net(netw: nn.Module,
         with open(filepath_score, "w") as f:
             f.write(str(saved_score))
 
-def val_state_net(netw: nn.Module, games_count: int = 100):
+def val_state_net(netw: nn.Module, games_count: int = 100, more_info: bool = False):
     scores = []
     netw.eval()
 
@@ -117,7 +119,11 @@ def val_state_net(netw: nn.Module, games_count: int = 100):
 
         scores.append(score - bl.NEURAL_PENALTY)
     netw.train()
-    return np.mean(scores), np.std(scores)
+    if more_info:
+        res = np.mean(scores), np.std(scores), np.max(scores), np.min(scores)
+    else:
+        res = np.mean(scores), np.std(scores)
+    return res
 
 def calculate_aux_targets(boards_tensor: torch.Tensor):
     b = boards_tensor.squeeze(1).bool()
@@ -152,6 +158,20 @@ def _randomise(mask: np.ndarray):
 
 class ActionNetworkTrainer:
     SAVE_PATH = "action_network_v1.pt"
+
+    @staticmethod
+    def test_network():
+        main_net = net.BL_DQN_Action_Network_v1()
+
+        try:
+            main_net.load_state_dict(torch.load(ActionNetworkTrainer.SAVE_PATH, weights_only=True))
+        except Exception as e:
+            print(f"Error - didn't managed to find network params in filepath{ActionNetworkTrainer.SAVE_PATH}\n")
+            return
+
+        main_net.validate_model(100)
+
+
 
     @staticmethod
     def _play_parallel_games(states: list, 
@@ -304,6 +324,47 @@ class StateNetworkTrainer:
     SAVE_PATH_SCORE = "best_score.txt"
 
     @classmethod
+    def showcase_network(cls):
+        main_net, _, _ = cls._get_components()
+        try:
+            main_net.load_state_dict(torch.load(cls.SAVE_PATH_NET, weights_only=True))
+        except Exception as e:
+            print(f"Error - didn't managed to find network params in filepath{cls.SAVE_PATH_NET}\n")
+            return
+
+        main_net.eval()
+        score = 0
+        game_over = False
+        state = bl.State()
+        while not game_over:
+            user_play.output_to_player(state, score, game_over)
+            (a_actions, a_rewards, a_terminals, a_boards, 
+             a_blocks, a_streaks, lengths) = cls._gather_data([state], [state.calculate_mask()])
+
+            q_per_game = cls._forward_data(a_rewards, a_terminals, a_boards,
+                                                a_blocks, a_streaks, main_net, lengths)
+            chosen_actions = cls._agent_decide(q_per_game, a_actions, 0.00)
+            rwrd, game_over, _ = state.transition(*bl.State.decode_action(a_actions[0][chosen_actions[0]]))
+            score += rwrd
+            time.sleep(2)
+
+        user_play.output_to_player(state, score, game_over)
+
+    @classmethod
+    def test_network(cls, games_count: int = 100):
+        main_net, _, _ = cls._get_components()
+        try:
+            main_net.load_state_dict(torch.load(cls.SAVE_PATH_NET, weights_only=True))
+        except Exception as e:
+            print(f"Error - didn't managed to find network params in filepath{cls.SAVE_PATH_NET}\n")
+            return
+
+        score, score_std, max, min = val_state_net(main_net, games_count, True) # type: ignore
+        print(f"Tested model performance - mean score: {score:.2f}, std: {score_std:.2f}, \
+max:{max:.4f}, min:{min:.4f}")
+
+
+    @classmethod
     def _get_components(cls):
         return net.BL_DQN_State_Network_v1(net.BL_DQN_State_Network()), \
                net.BL_DQN_State_Network_v1(net.BL_DQN_State_Network()), \
@@ -431,7 +492,7 @@ class StateNetworkTrainer:
                 f"{games_per_second:.2f}, batch time: {elapsed:.2f}s, eps: {eps:.4f}")
         print(f"Validating model performance...")
 
-        score, score_std = val_state_net(main_net, VALIDATION_GAMES_PER_BATCH)
+        score, score_std = val_state_net(main_net, VALIDATION_GAMES_PER_BATCH) # type: ignore
         print(f"Points in val games - mean: {score:.2f}, std: {score_std:.2f}")
         print()
 
@@ -445,6 +506,7 @@ class StateNetworkTrainer:
     def train_state_network(cls, games_count: int = GAMES_IN_PARALLEL):
         main_net, target_net, storage = cls._get_components()
         optimizer = torch.optim.Adam(main_net.parameters(), lr=LEARING_OPTIM_RATE)
+        scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=STEP_TO_MODIFY, gamma=GAMMA)
         batch_start_time = time.perf_counter()
         eps = EPS_MAX
 
@@ -471,6 +533,8 @@ class StateNetworkTrainer:
             loops += 1
             games_played += term_sum
             games_played_mod += term_sum
+            for _ in range(term_sum): 
+                scheduler.step()
             eps = max(EPS_MIN, eps * (DECAY_RATE ** games_count))
             games_played_mod, batch_start_time = cls._display_info(
                 games_played, games_played_mod, batch_start_time, eps, main_net
@@ -552,39 +616,71 @@ class HeavyTrainer(StateNetworkTrainer):
 
 # TODO - add options to switch between models for user, via console.
 def main(args):
-    if len(args) != 2:
-       print(f"Main needs one argument, but received: {len(args) - 1} arguments! Type './executable usage' for help!")
-       return 0
+    if len(args) < 2:
+        print("Please provide a command! Use command 'usage' for help!")
+        return 0
 
-    if args[1] == "train":
-        # ActionNetworkTrainer.train_action_network()
-        StateNetworkTrainer.train_state_network()
-        # AdvancedTrainer.train_state_network()
-        # LightTrainer.train_state_network()
-        # HeavyTrainer.train_state_network()
-        pass
-
-    elif args[1] == "test":
-        main_net = net.BL_DQN_State_Network_v1(net.BL_DQN_State_Network())
-        main_net.load_state_dict(torch.load(StateNetworkTrainer.SAVE_PATH_NET, weights_only=True))
-        score, score_std = val_state_net(main_net, 30)
-        print(f"Points in val games - mean: {score:.2f}, std: {score_std:.2f}")
-        pass
-
-    elif args[1] == "play_as_player":
-        user_play.play_as_player()
-
-    elif args[1] == "watch_ai_play":
-        raise RuntimeError("Not implemented yet!")
-
-    elif args[1] == "usage":
+    if args[1] == "usage":
         print(
     """Commands available for blokudoku_AI:
     train: trains the AI model
     test: tests the AI model
     play_as_player: play the game as a player, to compare score with the AI
     watch_ai_play: AI plays slowly, so you can watch it play
+
+    Models available for training and testing:
+    casual: BL_DQN_State_Network_v1 model (BEST RESULTS)
+    advanced: BL_DQN_State_Network_v2 model with auxiliary tasks
+
+    light: BL_DQN_State_Network_Light model (underfitting, not recommended)
+    heavy: BL_DQN_State_Network_Heavy model (very overfitting, not recommended)
+    action: BL_DQN_Action_Network_v1 model (very bad results, not recommended)
     """)
+    elif args[1] == "play_as_player":
+        bl.rng_fact_instance = bl.RandomFactory()
+        user_play.play_as_player()
+    elif len(args) != 3:
+        print(f"Please provide a command and a model name! Use command 'usage' for help!")
+        return 0
+
+    if args[1] == "train":
+        if args[2] == "casual":
+            StateNetworkTrainer.train_state_network()
+        elif args[2] == "advanced":
+            AdvancedTrainer.train_state_network()
+        elif args[2] == "light":
+            LightTrainer.train_state_network()
+        elif args[2] == "heavy":
+            HeavyTrainer.train_state_network()
+        elif args[2] == "action":
+            ActionNetworkTrainer.train_action_network()
+
+    elif args[1] == "test":
+        if args[2] == "casual":
+            StateNetworkTrainer.test_network()
+        elif args[2] == "advanced":
+            AdvancedTrainer.test_network()
+        elif args[2] == "light":
+            LightTrainer.test_network()
+        elif args[2] == "heavy":
+            HeavyTrainer.test_network()
+        elif args[2] == "action":
+            ActionNetworkTrainer.test_network()
+
+    elif args[1] == "watch_ai_play":
+        bl.rng_fact_instance = bl.RandomFactory()
+        if args[2] == "casual":
+            StateNetworkTrainer.showcase_network()
+        elif args[2] == "advanced":
+            AdvancedTrainer.showcase_network()
+        elif args[2] == "light":
+            LightTrainer.showcase_network()
+        elif args[2] == "heavy":
+            HeavyTrainer.showcase_network()
+        elif args[2] == "action":
+            raise RuntimeError("Not implemented yet!")
+            ActionNetworkTrainer.train_action_network()
+        pass
 
     else:
         print(f"Unrecgonised argument: {args[1]}! Use command 'usage' for help! ")

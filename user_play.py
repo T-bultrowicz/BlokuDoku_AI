@@ -54,7 +54,7 @@ def _print_blocks(blocks: np.ndarray):
 
     
 
-def _output_to_player(st: bl.State, score: int, terminal: bool):
+def output_to_player(st: bl.State, score: int, terminal: bool):
     print(f"Score: {score}, streak: {"ON" if st.in_streak() else "OFF"}")
     if terminal:
         print("Game Over!")
@@ -95,18 +95,17 @@ def _input_from_player(state: bl.State):
         return piece, x, y
 
 def play_as_player():
-    bl.rng_fact_instance = bl.RandomFactory()
     state = bl.State()
     game_over = False
     total_score = 0
 
     while not game_over:
-        _output_to_player(state, total_score, game_over)
+        output_to_player(state, total_score, game_over)
         piece, x, y = _input_from_player(state)
         rwrd, game_over, _ = state.transition(piece, x, y) 
         total_score += rwrd
     total_score -= bl.NEURAL_PENALTY
-    _output_to_player(state, total_score, game_over)
+    output_to_player(state, total_score, game_over)
 
 if __name__ == "__main__":
     play_as_player()

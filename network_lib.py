@@ -6,11 +6,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 class ResBlock(nn.Module):
-    def __init__(self, ch_in: int, ch_out: int, ker):
+    def __init__(self, channels: int, ker):
         super().__init__()
-        self.conv1 = nn.Conv2d(in_channels=ch_in, out_channels=ch_out, 
+        self.conv1 = nn.Conv2d(in_channels=channels, out_channels=channels, 
                                kernel_size=ker, padding='same')
-        self.conv2 = nn.Conv2d(in_channels=ch_out, out_channels=ch_out, 
+        self.conv2 = nn.Conv2d(in_channels=channels, out_channels=channels, 
                                kernel_size=ker, padding='same')
 
     def forward(self, x):
@@ -37,12 +37,12 @@ class BL_DQN_Conv_Network(nn.Module):
             nn.ReLU()
         )
         conv_general = nn.Sequential(
-            ResBlock(out_gen, out_gen, self.KER_DEF),
-            ResBlock(out_gen, out_gen, self.KER_DEF)
+            ResBlock(out_gen, self.KER_DEF),
+            ResBlock(out_gen, self.KER_DEF)
         )
         conv_striped = nn.Sequential(
-            ResBlock(out_gen, out_gen, self.KER_LAT),
-            ResBlock(out_gen, out_gen, self.KER_VER)
+            ResBlock(out_gen, self.KER_LAT),
+            ResBlock(out_gen, self.KER_VER)
         )
         conv_summary = nn.Sequential(
             nn.Conv2d(out_gen, out_sum, self.KER_DEF, padding='same'),
@@ -71,6 +71,7 @@ class BL_DQN_Conv_Network_Light(BL_DQN_Conv_Network):
         super().forward(x)
 
 # For now the same as usual conv network.
+# OVERFITTING !!!
 class BL_DQN_Conv_Network_Heavy(nn.Module):
     IN_CON_CHANNELS = 1
     OUT_GEN_CONV = 128
@@ -91,14 +92,14 @@ class BL_DQN_Conv_Network_Heavy(nn.Module):
             nn.ReLU()
         )
         conv_general = nn.Sequential(
-            ResBlock(out_gen, out_gen, self.KER_DEF),
-            ResBlock(out_gen, out_gen, self.KER_DEF)
+            ResBlock(out_gen, self.KER_DEF),
+            ResBlock(out_gen, self.KER_DEF)
         )
         conv_striped = nn.Sequential(
-            ResBlock(out_gen, out_gen, self.KER_LAT),
-            ResBlock(out_gen, out_gen, self.KER_VER),
-            ResBlock(out_gen, out_gen, self.KER_LAT),
-            ResBlock(out_gen, out_gen, self.KER_VER)
+            ResBlock(out_gen, self.KER_LAT),
+            ResBlock(out_gen, self.KER_VER),
+            ResBlock(out_gen, self.KER_LAT),
+            ResBlock(out_gen, self.KER_VER)
         )
         conv_summary = nn.Sequential(
             nn.Conv2d(out_gen, out_sum, self.KER_DEF, padding='same'),
@@ -184,8 +185,8 @@ class BL_DQN_Action_Network_v1(nn.Module):
 class BL_DQN_State_Network_Base(nn.Module):
     STR_DENSE_DIM = 16
     OUT_EMBED_DIM = 16
-    HID_LIN_DIM_1 = 384
-    HID_LIN_DIM_2 = 192
+    HID_LIN_DIM_1 = 256
+    HID_LIN_DIM_2 = 256
 
     def __init__(self, conv_class, conv_out_channels, 
                 hid_dim_1: int = HID_LIN_DIM_1, hid_dim_2: int = HID_LIN_DIM_2):
