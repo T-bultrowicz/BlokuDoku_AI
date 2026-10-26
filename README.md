@@ -1,4 +1,3 @@
-```markdown
 # Blockudoku AI Agent
 
 An efficient **Deep Q-Learning (DQN)** agent learning to play Blockudoku from scratch. Instead of the classic $Q(s, a)$ approach, the project utilizes an **Afterstate ($V(s')$)** network that evaluates board states after a move, which drastically accelerates convergence and training stability.
