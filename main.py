@@ -46,14 +46,16 @@ def try_write_best_net(netw: nn.Module,
     only when same type of network is scored in file filepath_net, otherwise
     may result in fatal error. Follows algorithm below:
 
-    1. If there is no proper save of network under filepath_net & filepath_score,
-    save netw and netw_res (return)
+    1. If there is no proper save of network under filepath_net,
+    save netw and netw_res (return).
 
     2. Otherwise, compare netw_res with score on filepath_score, if netw_res is 
     worse more than MARGIN points, forfeit saving to not overwrite better model.
 
     3. If scores are similar, perform additional validation on val_games_num
     games to save better performing net.
+
+    P.S. If filepath_score is not present, validation of both network still occurs.
 
     Args:
         netw: network model to save
@@ -62,7 +64,7 @@ def try_write_best_net(netw: nn.Module,
         val_games_num: number of validation games to perform, if needed.
         netw_res: result network achieved when validated first.
     """
-    if not os.path.exists(filepath_score) or not os.path.exists(filepath_net):
+    if not os.path.exists(filepath_net):
         torch.save(netw.state_dict(), filepath_net)
         current_score, _ = val_state_net(netw, val_games_num) # type: ignore
         
@@ -75,7 +77,7 @@ def try_write_best_net(netw: nn.Module,
         try:
             saved_score = float(f.read())
         except ValueError:
-            saved_score = -1e2
+            saved_score = netw_res
     if netw_res + MARGIN < saved_score:
         return
 
