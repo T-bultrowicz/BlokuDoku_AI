@@ -23,8 +23,8 @@ VALIDATION_GAMES_PER_FIGHT = 25
 # BASIC LEARING HYPERPARAMETERS
 EPS_MAX = 1.0
 EPS_MIN = 0.005
-DECAY_RATE = 0.999995
-DISCOUNT = 0.999
+DECAY_RATE = 0.9999975
+DISCOUNT = 0.995
 BATCH_SIZE = 128
 LEARING_OPTIM_RATE = 1e-4
 
@@ -40,6 +40,28 @@ def try_write_best_net(netw: nn.Module,
                        filepath_score: str, 
                        val_games_num: int,
                        netw_res: float = 0.0):
+    """ Save network and results it achieved.
+
+    Used as validation tool in model selection. Be cautious to invoke it
+    only when same type of network is scored in file filepath_net, otherwise
+    may result in fatal error. Follows algorithm below:
+
+    1. If there is no proper save of network under filepath_net & filepath_score,
+    save netw and netw_res (return)
+
+    2. Otherwise, compare netw_res with score on filepath_score, if netw_res is 
+    worse more than MARGIN points, forfeit saving to not overwrite better model.
+
+    3. If scores are similar, perform additional validation on val_games_num
+    games to save better performing net.
+
+    Args:
+        netw: network model to save
+        filepath_net: filepath to save netw
+        filepath_score: filepath to save netw result
+        val_games_num: number of validation games to perform, if needed.
+        netw_res: result network achieved when validated first.
+    """
     if not os.path.exists(filepath_score) or not os.path.exists(filepath_net):
         torch.save(netw.state_dict(), filepath_net)
         current_score, _ = val_state_net(netw, val_games_num) # type: ignore
@@ -90,6 +112,18 @@ def try_write_best_net(netw: nn.Module,
             f.write(str(saved_score))
 
 def val_state_net(netw: nn.Module, games_count: int = 100, more_info: bool = False):
+    """ Function that validates netw performance on games_count games.
+
+    Args:
+        games_count: games to play
+        more_info: whether to return more
+
+    Returns:
+        mean: mean of achieved results
+        std: std of achieved results
+        max (only if more_info=True): max of achieved results
+        min (only if more_info=True): min of achieved results
+    """
     scores = []
     netw.eval()
 
@@ -126,9 +160,20 @@ def val_state_net(netw: nn.Module, games_count: int = 100, more_info: bool = Fal
     return res
 
 def calculate_aux_targets(boards_tensor: torch.Tensor):
+    """ Calculate auxiliray targets for a boards_tensor,
+    representing look of boards.
+
+    Returns:
+        torch.Tensor of shape (Batch_num, Aux_feat_num), where aux features include:
+        1. Sum of taken fileds.
+        2. Non empty columns counter.
+        3. Non emprt rows counter.
+        4. Non empty 3x3 blocks counter.
+        5. Number of holes inside a board (empty places fully surrounded by blocks).
+    """
     b = boards_tensor.squeeze(1).bool()
     
-    # 1. Taken fileds
+    # 1. Taken fields
     f1 = b.sum(dim=(1, 2)) 
     # 2. Non empty columns (normalized 0-1)
     f2 = (b.sum(dim=1) > 0).float().sum(dim=1)
@@ -157,10 +202,17 @@ def _randomise(mask: np.ndarray):
     return bl.rng_fact_instance.choice(valid_actions)
 
 class ActionNetworkTrainer:
+    """ Class capable of triaing and testing BL_DQN_Action_Network_v1().
+
+    Defaultly saves network under path ActionNetworkTrainer.SAVE_PATH, 
+    feel free to overwrite if different path is desired.
+    """
     SAVE_PATH = "action_network_v1.pt"
 
     @staticmethod
     def test_network():
+        """Tests netowork on 100 games.
+        """
         main_net = net.BL_DQN_Action_Network_v1()
 
         try:
@@ -284,6 +336,13 @@ class ActionNetworkTrainer:
 
     @staticmethod
     def train_action_network(games_count: int = GAMES_IN_PARALLEL):
+        """ Trains network on games_count games being played in parallel. 
+        
+        IMPORTANT: Changing games_count also requires to change global variable 
+        BATCH_SIZE to preserve same ratio of forward_moves / learning_moves ratio.
+        Games_count equal 16 was tested to be optimal for speed on my device.
+
+        """
         main_net = net.BL_DQN_Action_Network_v1()
         target_net = net.BL_DQN_Action_Network_v1()
         storage = net.ActionsStorage()
@@ -320,11 +379,16 @@ class ActionNetworkTrainer:
         torch.save(main_net.state_dict(), ActionNetworkTrainer.SAVE_PATH)
 
 class StateNetworkTrainer:
+    """ Class for working with default BL_DQN_State_Network_v1() NN model.
+    """
     SAVE_PATH_NET = "state_network_v1.pt"
     SAVE_PATH_SCORE = "best_score.txt"
 
     @classmethod
     def showcase_network(cls):
+        """ Interactive display in terminal (stdout), of how network saved under
+        SAVE_PATH_NET plays the game.
+        """
         main_net, _, _ = cls._get_components()
         try:
             main_net.load_state_dict(torch.load(cls.SAVE_PATH_NET, weights_only=True))
@@ -352,6 +416,8 @@ class StateNetworkTrainer:
 
     @classmethod
     def test_network(cls, games_count: int = 100):
+        """ Validate network on the set of games_count games. Print result to stdout.
+        """
         main_net, _, _ = cls._get_components()
         try:
             main_net.load_state_dict(torch.load(cls.SAVE_PATH_NET, weights_only=True))
@@ -504,6 +570,13 @@ max:{max:.4f}, min:{min:.4f}")
 
     @classmethod
     def train_state_network(cls, games_count: int = GAMES_IN_PARALLEL):
+        """ Trains network on games_count games being played in parallel. 
+        
+        IMPORTANT: Changing games_count also requires to change global variable 
+        BATCH_SIZE to preserve same ratio of forward_moves / learning_moves ratio.
+        Games_count equal 16 was tested to be optimal for speed on my device.
+
+        """
         main_net, target_net, storage = cls._get_components()
         optimizer = torch.optim.Adam(main_net.parameters(), lr=LEARING_OPTIM_RATE)
         scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=STEP_TO_MODIFY, gamma=GAMMA)
@@ -545,6 +618,9 @@ max:{max:.4f}, min:{min:.4f}")
                 target_net.load_state_dict(main_net.state_dict())
 
 class AdvancedTrainer(StateNetworkTrainer):
+    """ Class for working with auxiliary training of BL_DQN_State_Network_v2 model,
+    with default - medium size.
+    """
     SAVE_PATH_NET = "state_network_v2.pt"
     SAVE_PATH_SCORE = "best_score_v2.txt"
     NUM_AUX = 5
@@ -595,6 +671,8 @@ class AdvancedTrainer(StateNetworkTrainer):
         optimizer.step()
 
 class LightTrainer(StateNetworkTrainer):
+    """ Class for working with BL_DQN_State_Network_v1() light version model.
+    """
     SAVE_PATH_NET = "state_network_light.pt"
     SAVE_PATH_SCORE = "best_score_light.txt"
 
@@ -605,6 +683,8 @@ class LightTrainer(StateNetworkTrainer):
                net.StateStorage()
 
 class HeavyTrainer(StateNetworkTrainer):
+    """ Class for working with BL_DQN_State_Network_v1() heavy version model.
+    """
     SAVE_PATH_NET = "state_network_heavy.pt"
     SAVE_PATH_SCORE = "best_score_heavy.txt"
 
@@ -629,7 +709,7 @@ def main(args):
     watch_ai_play: AI plays slowly, so you can watch it play
 
     Models available for training and testing:
-    casual: BL_DQN_State_Network_v1 model (BEST RESULTS)
+    casual: BL_DQN_State_Network_v1 model (BEST RESULTS by far, recommended)
     advanced: BL_DQN_State_Network_v2 model with auxiliary tasks
 
     light: BL_DQN_State_Network_Light model (underfitting, not recommended)

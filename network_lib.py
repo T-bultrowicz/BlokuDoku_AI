@@ -6,7 +6,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 class ResBlock(nn.Module):
-    def __init__(self, channels: int, ker):
+    """Build single residual convolutional network block.
+
+    Args:
+        channels: nn.conv2d in_channels parameter.
+        ker: nn.conv2d kernel_size parameter.
+    """
+    def __init__(self, channels: int, ker: tuple):
         super().__init__()
         self.conv1 = nn.Conv2d(in_channels=channels, out_channels=channels, 
                                kernel_size=ker, padding='same')
@@ -20,6 +26,14 @@ class ResBlock(nn.Module):
         return F.relu(out + residual)
 
 class BL_DQN_Conv_Network(nn.Module):
+    """Build conv_network responsible for analyzing board state.
+
+    Paramter count: 314 528. Activation: ReLU
+    Args:
+        in_chan: Number of input conv2d channels.
+        out_gen: Number of conv2d channels in hidden layers.
+        out_sum: Number of conv2d channels in output layer.
+    """
     IN_CON_CHANNELS = 1
     OUT_GEN_CONV = 64
     OUT_SUM_CONV = 32
@@ -60,6 +74,10 @@ class BL_DQN_Conv_Network(nn.Module):
         return self.conv_net(x)
 
 class BL_DQN_Conv_Network_Light(BL_DQN_Conv_Network):
+    """ Build lighter version of BL_DQN_CONV_Network.
+
+    Parameter count: 177 144. Activation: ReLU
+    """
     IN_CON_CHANNELS = 1
     OUT_GEN_CONV = 48
     OUT_SUM_CONV = 24
@@ -67,12 +85,12 @@ class BL_DQN_Conv_Network_Light(BL_DQN_Conv_Network):
     def __init__(self):
         super().__init__(self.IN_CON_CHANNELS, self.OUT_GEN_CONV, self.OUT_SUM_CONV)
 
-    def forward(self, x):
-        super().forward(x)
-
-# For now the same as usual conv network.
-# OVERFITTING !!!
 class BL_DQN_Conv_Network_Heavy(nn.Module):
+    """ Build heavier version of BL_DQN_CONV_Network.
+
+    This network has high possibility of overfitting.
+    Parameter count: 1 846 080 Activation: ReLU
+    """
     IN_CON_CHANNELS = 1
     OUT_GEN_CONV = 128
     OUT_SUM_CONV = 64
@@ -118,6 +136,10 @@ class BL_DQN_Conv_Network_Heavy(nn.Module):
     
 
 class BL_DQN_Action_Network_v1(nn.Module):
+    """ Build NN working as regressor for Belmann Equations of Bloku Doku game.
+
+    This NN achieves very poor results.
+    """
     STR_DENSE_DIM = 16
     OUT_EMBED_DIM = 16
 
@@ -154,6 +176,11 @@ class BL_DQN_Action_Network_v1(nn.Module):
         return self.afterwards_net(final_input)
 
     def validate_model(self, num_games: int = 1):
+        """ Validate perfomance of NN.
+
+        Args:
+            num_games: Number of games to validate on.
+        """
         scores = []
         for _ in range(num_games):
             st_nw = bl.State()
@@ -183,6 +210,14 @@ class BL_DQN_Action_Network_v1(nn.Module):
         return f"Points in val games: {scores}, mean: {np.mean(scores):.2f}, std: {np.std(scores):.2f}"
 
 class BL_DQN_State_Network_Base(nn.Module):
+    """ Build base for NN models designed to be predictors for values of states.
+
+    Args:
+        conv_class: Convolutional network for board state analysis.
+        conv_out_channels: conv_out parameter of passed in conv_class.
+        hid_dim_1: Neuron count in first hidden later.
+        hid_dim_2: Neuron count in second hidden later.
+    """
     STR_DENSE_DIM = 16
     OUT_EMBED_DIM = 16
     HID_LIN_DIM_1 = 256
@@ -222,10 +257,20 @@ class BL_DQN_State_Network_Base(nn.Module):
         return self.afterwards_net(final_input)
 
 class BL_DQN_State_Network(BL_DQN_State_Network_Base):
+    """ Build basic NN predictor for state values. Achieves the best results.
+
+    Parameter count: 314 528 (CNN) + 746 784 (Dense) = 1 061 312
+    Activation: ReLU
+    """
     def __init__(self):
         super().__init__(BL_DQN_Conv_Network, BL_DQN_Conv_Network.OUT_SUM_CONV)
 
 class BL_DQN_State_Network_Light(BL_DQN_State_Network_Base):
+    """ Build light version NN predictor for state values.
+
+    Parameter count: 177 144 (CNN) + 521 264 (Dense) = 698 408
+    Activation: ReLU
+    """
     STR_DENSE_DIM = 8
     HID_LIN_DIM_1 = 256
     HID_LIN_DIM_2 = 32
@@ -235,6 +280,12 @@ class BL_DQN_State_Network_Light(BL_DQN_State_Network_Base):
                     self.HID_LIN_DIM_1, self.HID_LIN_DIM_2)
 
 class BL_DQN_State_Network_Heavy(BL_DQN_State_Network_Base):
+    """ Build heavy version NN predictor for state values.
+
+    Paramter count: 1 846 080 (CNN) + 1 410 336 (Dense) = 3 256 416
+    Activation: ReLU
+    Currently overfits! Forget or try to adjust learning hyperparameters.
+    """
     HID_LIN_DIM_1 = 256
     HID_LIN_DIM_2 = 256
 
@@ -243,6 +294,8 @@ class BL_DQN_State_Network_Heavy(BL_DQN_State_Network_Base):
                     self.HID_LIN_DIM_1, self.HID_LIN_DIM_2)
 
 class BL_DQN_State_Network_v1(nn.Module):
+    """ Constructor for different NNs with no auxiliary features prediction.
+    """
     def __init__(self, 
     base_network: BL_DQN_State_Network | BL_DQN_State_Network_Light | BL_DQN_State_Network_Heavy):
         super().__init__()
@@ -254,6 +307,8 @@ class BL_DQN_State_Network_v1(nn.Module):
         return self.final(x)
 
 class BL_DQN_State_Network_v2(nn.Module): 
+    """ Constructor for different NNs with additional auxiliary features prediction.
+    """
     def __init__(self, 
                 base_network: BL_DQN_State_Network | BL_DQN_State_Network_Light | BL_DQN_State_Network_Heavy,
                 num_aux_features: int = 0):
@@ -262,6 +317,12 @@ class BL_DQN_State_Network_v2(nn.Module):
         self.value_head = nn.Linear(base_network.HID_LIN_DIM_2, 1)
         self.aux_head = nn.Linear(base_network.HID_LIN_DIM_2, num_aux_features)
 
+    """ Forward pass of neural network.
+
+    Returns:
+        Vs: Predicted values of passed in states.
+        Auxs: Predicted valeus of auxilliary features, that passed in states have.
+    """
     def forward(self, board: torch.Tensor, blocks: torch.Tensor, streak: torch.Tensor):
         x = self.network(board, blocks, streak)
         v_value = self.value_head(x)
@@ -270,6 +331,11 @@ class BL_DQN_State_Network_v2(nn.Module):
         return v_value, aux_features
 
 class ActionsStorage:
+    """ Class for optimal, low memory storage of moves history.
+
+    Works as circular buffer with memory off up to self.TOTAL_SIZE (1e6) games.
+    Automatically forgets the oldest moves when it gets filled up.
+    """
     TOTAL_SIZE = 1_000_000
 
     def __init__(self):
@@ -311,6 +377,15 @@ class ActionsStorage:
                           boards_f: np.ndarray, blocks_f: np.ndarray, streaks_f: np.ndarray,
                           actions: np.ndarray, rewards: np.ndarray, terminals: np.ndarray, 
                           masks_f: np.ndarray):
+        """ Add detailed records of singular moves to storage.
+
+        Args:
+            board_s, blocks_s, streaks_s: Pre-action state.
+            boards_f, blocks_f, streaks_f: Post-action state.
+            actions: Actions encoded as integers.
+            rewards: Rewards from taking actions.
+            terminals, masks_f: Whether post-action state is terminal and possible moves from it.
+        """
         
         n = len(boards_s) # Amount of records to add.
         incoming_data = (
@@ -324,6 +399,15 @@ class ActionsStorage:
         self.size = min(self.size + n, self.TOTAL_SIZE)
 
     def sample(self, num_samples: int = 1):
+        """ Randomly sample games from storage.
+
+        Args:
+            num_samples: Size of the sample.
+
+        Returns:
+            np.arrays representing informations of singular moves, in a same
+            order and functionality as described for add_records() method.
+        """
         idx = bl.rng_fact_instance.sample(range(self.size), num_samples)
         return (
             self.boards_s[idx],
@@ -339,6 +423,11 @@ class ActionsStorage:
         )
 
 class StateStorage:
+    """ Class for optimal, low memory storage of moves history.
+
+    Works as circular buffer with memory off up to self.TOTAL_SIZE (1e6) games.
+    Automatically forgets the oldest moves when it gets filled up.
+    """
     TOTAL_SIZE = 1_000_000
     def __init__(self):
         self.boards_s = np.empty((self.TOTAL_SIZE, 1, bl.BOARD_LEN, bl.BOARD_LEN), dtype=bool)
@@ -375,6 +464,15 @@ class StateStorage:
     def add_records(self, boards_s: np.ndarray, blocks_s: np.ndarray, streaks_s: np.ndarray,
                           boards_f: np.ndarray, blocks_f: np.ndarray, streaks_f: np.ndarray,
                           rewards: np.ndarray, terminals: np.ndarray):
+        """ Add detailed records of singular moves to storage.
+
+        Args:
+            board_s, blocks_s, streaks_s: Pre-action state.
+            boards_f, blocks_f, streaks_f: Post-action state.
+            actions: Actions encoded as integers.
+            rewards: Rewards from taking actions.
+            terminals: Whether post-action state is terminal.
+        """
         n = len(boards_s) # Amount of records to add.
         incoming_data = (
             boards_s, blocks_s, streaks_s,
@@ -387,6 +485,15 @@ class StateStorage:
         self.size = min(self.size + n, self.TOTAL_SIZE)
 
     def sample(self, num_samples: int = 1):
+        """ Randomly sample games from storage.
+
+        Args:
+            num_samples: Size of the sample.
+
+        Returns:
+            np.arrays representing informations of singular moves, in a same
+            order and functionality as described for add_records() method.
+        """
         idx = bl.rng_fact_instance.sample(range(self.size), num_samples)
         return (
             self.boards_s[idx],
@@ -400,6 +507,13 @@ class StateStorage:
         )
 
 class SmartStateStorage:
+    """ Class for optimal, low memory storage of moves history, that allows
+    sampling with respect to stratified distribution based on boards crowdness.
+
+    Works as circular buffer with memory off up to self.TOTAL_SIZE (1e6) games.
+    Automatically forgets the oldest moves when it gets filled up.
+    EXPERIMENTAL, DID NOT ACHIEVE ANY PROFOUND RESULTS.
+    """
     EMPTY_BOARDS_MAX = 16
     CASUAL_BOARDS_MAX = 32
     CROWDED_BOARDS_MAX = 48
@@ -420,6 +534,15 @@ class SmartStateStorage:
     def add_records(self, boards_s: np.ndarray, blocks_s: np.ndarray, streaks_s: np.ndarray,
                           boards_f: np.ndarray, blocks_f: np.ndarray, streaks_f: np.ndarray,
                           rewards: np.ndarray, terminals: np.ndarray):
+        """ Add detailed records of singular moves to storage.
+
+        Args:
+            board_s, blocks_s, streaks_s: Pre-action state.
+            boards_f, blocks_f, streaks_f: Post-action state.
+            actions: Actions encoded as integers.
+            rewards: Rewards from taking actions.
+            terminals: Whether post-action state is terminal.
+        """
         board_counts = np.sum(boards_s.reshape(len(boards_s), -1), axis=1)
         empty_mask = board_counts <= self.EMPTY_BOARDS_MAX
         casual_mask = (board_counts > self.EMPTY_BOARDS_MAX) & (board_counts <= self.CASUAL_BOARDS_MAX)
@@ -439,6 +562,16 @@ class SmartStateStorage:
         push(self.ultra_crowded_boards, ultra_crowded_mask)
 
     def sample(self, num_samples: int = 1):
+        """ Randomly sample games from storage, following stratified distribution
+        based around crowdness of the board.
+
+        Args:
+            num_samples: Size of the sample.
+
+        Returns:
+            np.arrays representing informations of singular moves, in a same
+            order and functionality as described for add_records() method.
+        """
         part = 5 * num_samples // 16
 
         s1 = self.empty_boards.sample(part)

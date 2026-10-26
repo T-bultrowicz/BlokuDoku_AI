@@ -3,6 +3,7 @@ import math
 import numpy as np
 import random as rand
 
+# Array defining shapes of all possible blocks with rotations.
 BLOCKS = [
     # SQUARE PIECES
     [(0, 0)], 
@@ -66,14 +67,17 @@ BLOCKS = [
     [(0, 0), (1, 0), (-1, 0), (0, 1), (0, -1)],
 ]
 BLOCKS_SIZE = len(BLOCKS)
-EMPTY_SLOT = len(BLOCKS)
+EMPTY_SLOT = len(BLOCKS) # Descripes empty block choice.
 BLOCKS_TO_PICK = 3
 BOARD_FLAT = 81
 BOARD_LEN = 9
 BOARD_SIZE = (9, 9)
 NN_OUTPUT_FLAT = BLOCKS_TO_PICK * BOARD_FLAT
+
+# Parameter for NN training, used to punish terminal states.
 NEURAL_PENALTY = -50
 
+# Factory used to generate states in BlokuDoku training games.
 class RandomFactory:
     DEF_SEED = 13579
 
@@ -84,6 +88,8 @@ class RandomFactory:
             self._random = rand.Random(seed)
 
     def new_blocks(self):
+        """ Return new list of random 3 blocks.
+        """
         return self._random.choices(range(BLOCKS_SIZE), k=BLOCKS_TO_PICK)
 
     def sample(self, list, k: int = 1):
@@ -93,31 +99,52 @@ class RandomFactory:
         return self._random.choice(list)
 
     def explore_now(self, eps: float=0.0):
+        """ Draw whether agent of given eps should perform exploration.
+        """
         return self._random.random() < eps
-
 rng_fact_instance = RandomFactory(RandomFactory.DEF_SEED)
 
 class State:
+    TOTAL_CLEANUP_REWARD = 100
+    CLEARING_REWARD = 18
+    STREAK_REWARD = 9
+
     def __init__(self):
+        """ Used to encapsulate all logic of Bloku Doku game.
+        """
         self._board = np.zeros(BOARD_SIZE, bool)
         self._count = BLOCKS_TO_PICK
         self._available = rng_fact_instance.new_blocks()
         self._streak = False
     
     def in_board(self):
+        """ Return current state of the board, reshaped to (1, BOARD_LEN, BOARD_LEN)
+        for better symbiosis with torch.Tensor.
+        """
         return np.array(self._board.copy(),dtype=bool).reshape((1, BOARD_LEN, BOARD_LEN))
     
     def in_blocks(self):
+        """ Return currently available block array(3,).
+        """
         tmp = self._available.copy()
         for i in range(len(tmp), 3):
             tmp.append(EMPTY_SLOT)
         return np.array(tmp, dtype=np.int8)
 
     def in_streak(self):
+        """Return bool informing about streak, reshaped to array(1,).
+        """
         return np.array([self._streak], dtype=bool)
 
     @staticmethod
     def decode_action(action: int):
+        """ Unpack flat encoded action index.
+
+        Action is represented as tuple (piece_chosen, x_cord, y_cord), where: \\
+        piece_chosen: int -> in range [1, BLOCKS_TO_PICK] \\
+        x_cord: int -> in range [1, BOARD_LEN] \\
+        y_cord: int -> in range [1, BOARD_LEN]
+        """
         piece = action // BOARD_FLAT
         pos = action % BOARD_FLAT
         x = pos // BOARD_LEN
@@ -126,6 +153,8 @@ class State:
 
     @staticmethod
     def _get_valid_mask(board: np.ndarray, idx: int) -> np.ndarray:
+        """ Return mask of valid positions for placing BLOCKS[idx].
+        """
         block = BLOCKS[idx]
         valid_mask = np.ones(BOARD_SIZE, dtype=bool)
         n = BOARD_LEN
@@ -142,6 +171,18 @@ class State:
         return valid_mask
 
     def _calculate_strikes(self, block: list, x: int, y: int):
+        """ Calculate clearings of the board, after swipe moves.
+        
+        Modify inside state accordingly to those clearings.
+
+        Args:
+            block, x, y: Represent placement of a new block on a board. 
+            (Passed in for optimalization purposes)
+
+        Returns:
+            A pair (int, bool) informing on reward in points,
+            and whether any clearing was made.
+        """
         streak = False
         rwrd = 0
         # Check for completed rows, columns, and 3x3 squares, note them
@@ -167,7 +208,7 @@ class State:
                 rwrd += 1
             else:
                 streak = True 
-
+        # Execute clearings.
         for what, id in hits:
             if what == 0:
                 self._board[id, :] = False
@@ -177,12 +218,19 @@ class State:
                 org_x = id % 8
                 org_y = id // 8
                 self._board[org_x:org_x+3, org_y:org_y+3] = False
-
-        rwrd += streak * self._streak * 9
-        rwrd += len(hits) * 18
+        # Calculate reward.
+        rwrd += streak * self._streak * State.STREAK_REWARD
+        rwrd += len(hits) * State.CLEARING_REWARD
         return rwrd, streak
 
     def calculate_mask(self):
+        """ Calculate legal / illegal mask of all moves from current state.
+
+        Value of mask[index] = 0 marks that move encoded as index is illegal.
+
+        Returns:
+            mask: Mask of legality of moves.
+        """
         mask = np.zeros((BLOCKS_TO_PICK, BOARD_LEN, BOARD_LEN), bool)
         mask[0, :, :] = self._get_valid_mask(self._board, self._available[0])
 
@@ -200,6 +248,13 @@ class State:
         return mask.reshape(NN_OUTPUT_FLAT)
 
     def transition_key(self, piece: int, x: int, y: int):
+        """ Transition state according to given action (piece, x, y).
+
+        Transition occures in place and reward value of that action is returned.
+
+        Returns:
+            rwrd: Value of reward from transition T(state, action).
+        """
         block_id = self._available[piece]
         block = BLOCKS[block_id]
 
@@ -212,7 +267,7 @@ class State:
         # calculate reward and a new board
         rwrd, self._streak = self._calculate_strikes(block, x, y)
         if not self._board.any():
-            rwrd += 100
+            rwrd += State.TOTAL_CLEANUP_REWARD
 
         # check if we need to sample new blocks
         if self._count == 0:
@@ -222,6 +277,16 @@ class State:
         return rwrd
 
     def transition(self, piece: int, x: int, y: int):
+        """Alike transition_key, but return mask for state'.
+        
+        More computationally heavy.
+
+        Returns:
+            List holding three values - 
+            rwrd: Value of reward from transition T(state, action).
+            terminal: Whether state' is terminal.
+            mask: np.array masking legal moves from state'.
+        """
         rwrd = self.transition_key(piece, x, y)
         mask = self.calculate_mask()
         if not mask.any():
@@ -229,6 +294,23 @@ class State:
         return [rwrd, bool(not mask.any()), mask]
 
     def all_1move_states(self, mask: np.ndarray):
+        """Calculate all variants of moves from this state and thier afterstate.
+
+        Returned numpy arrays are reshaped to work well as NN input, after being
+        transformed to torch.Tensor.
+
+        Args:
+            mask: Mask of legal moves, returned from self.calculate_mask().
+
+        Returns:
+            Tuple (A, R, T, B, L, S), where:
+            A: Valid actions, encoded as integers.
+            R[i]: - reward from picking action A[i].
+            T[i]: - is A[i] terminal.
+            B[i]: - state of board after taking action A[i].
+            L[i]: - blocks available after taking action A[i].
+            S[i]: - is streak on after action A[i]. 
+        """
         actions = np.flatnonzero(mask).astype(int)
         n_moves = len(actions)
 
@@ -249,6 +331,8 @@ class State:
         return actions, rewards, terminals, out_boards, out_blocks, out_streaks
 
     def copy(self):
+        """ Get a copy of the State object.
+        """
         new_st = object.__new__(self.__class__)
         new_st._board = self._board.copy()
         new_st._count = self._count

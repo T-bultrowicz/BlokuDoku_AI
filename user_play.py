@@ -52,9 +52,14 @@ def _print_blocks(blocks: np.ndarray):
         offset += 6
     _print_board(arr, is_block=True)
 
-    
-
 def output_to_player(st: bl.State, score: int, terminal: bool):
+    """ Prints game state to stdout in readeble form.
+
+    Args:
+        st: blokudoku_lib.State object.
+        score: Score to be displayed.
+        terminal: Whether to display game over message.
+    """
     print(f"Score: {score}, streak: {"ON" if st.in_streak() else "OFF"}")
     if terminal:
         print("Game Over!")
@@ -63,6 +68,8 @@ def output_to_player(st: bl.State, score: int, terminal: bool):
         _print_blocks(st.in_blocks())
 
 def _input_from_player(state: bl.State):
+    """ Receive player input from stdout. Verifies incorrect input.
+    """
     prompt = "Give number of pawn, then lateral coordinate, finally vertical coordinate: "
     while True:
         try:
@@ -95,6 +102,8 @@ def _input_from_player(state: bl.State):
         return piece, x, y
 
 def play_as_player():
+    """ Function that allows to play Bloku Doku game inside terminal.
+    """
     state = bl.State()
     game_over = False
     total_score = 0
