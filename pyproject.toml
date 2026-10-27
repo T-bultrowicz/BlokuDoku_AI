@@ -9,6 +9,7 @@ dependencies = [
     "opencv-python>=5.0.0.93",
     "pandas>=3.0.6",
     "pure-python-adb>=0.3.0.dev0",
+    "ruff>=0.17.3",
     "torch",
 ]
 

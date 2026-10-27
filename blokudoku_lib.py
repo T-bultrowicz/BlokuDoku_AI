@@ -6,7 +6,7 @@ import random as rand
 # Array defining shapes of all possible blocks with rotations.
 BLOCKS = [
     # SQUARE PIECES
-    [(0, 0)], 
+    [(0, 0)],
     [(0, 0), (1, 0), (0, 1), (1, 1)],
     # LINE PIECES - LATERAL
     [(0, 0), (1, 0)],
@@ -52,7 +52,7 @@ BLOCKS = [
     [(0, 0), (1, 0), (2, 0), (1, 1), (1, 2)],
     [(0, 0), (1, 0), (2, 0), (1, -1), (1, -2)],
     [(0, 0), (0, 1), (0, 2), (1, 1), (2, 1)],
-    [(0, 0), (1, 0), (2, 0), (2, -1), (2, 1)], 
+    [(0, 0), (1, 0), (2, 0), (2, -1), (2, 1)],
     # U PIECES
     [(0, 0), (1, 0), (0, 2), (1, 2), (1, 1)],
     [(0, 0), (1, 0), (0, 2), (1, 2), (0, 1)],
@@ -67,7 +67,7 @@ BLOCKS = [
     [(0, 0), (1, 0), (-1, 0), (0, 1), (0, -1)],
 ]
 BLOCKS_SIZE = len(BLOCKS)
-EMPTY_SLOT = len(BLOCKS) # Descripes empty block choice.
+EMPTY_SLOT = len(BLOCKS)  # Descripes empty block choice.
 BLOCKS_TO_PICK = 3
 BOARD_FLAT = 81
 BOARD_LEN = 9
@@ -77,19 +77,19 @@ NN_OUTPUT_FLAT = BLOCKS_TO_PICK * BOARD_FLAT
 # Parameter for NN training, used to punish terminal states.
 NEURAL_PENALTY = -50
 
+
 # Factory used to generate states in BlokuDoku training games.
 class RandomFactory:
     DEF_SEED = 13579
 
-    def __init__(self, seed = None):
+    def __init__(self, seed=None):
         if seed is None:
             self._random = rand.Random()
         else:
             self._random = rand.Random(seed)
 
     def new_blocks(self):
-        """ Return new list of random 3 blocks.
-        """
+        """Return new list of random 3 blocks."""
         return self._random.choices(range(BLOCKS_SIZE), k=BLOCKS_TO_PICK)
 
     def sample(self, list, k: int = 1):
@@ -98,11 +98,13 @@ class RandomFactory:
     def choice(self, list):
         return self._random.choice(list)
 
-    def explore_now(self, eps: float=0.0):
-        """ Draw whether agent of given eps should perform exploration.
-        """
+    def explore_now(self, eps: float = 0.0):
+        """Draw whether agent of given eps should perform exploration."""
         return self._random.random() < eps
+
+
 rng_fact_instance = RandomFactory(RandomFactory.DEF_SEED)
+
 
 class State:
     TOTAL_CLEANUP_REWARD = 100
@@ -110,30 +112,27 @@ class State:
     STREAK_REWARD = 9
 
     def __init__(self):
-        """ Used to encapsulate all logic of Bloku Doku game.
-        """
+        """Used to encapsulate all logic of Bloku Doku game."""
         self._board = np.zeros(BOARD_SIZE, bool)
         self._count = BLOCKS_TO_PICK
         self._available = rng_fact_instance.new_blocks()
         self._streak = False
-    
+
     def in_board(self):
-        """ Return current state of the board, reshaped to (1, BOARD_LEN, BOARD_LEN)
+        """Return current state of the board, reshaped to (1, BOARD_LEN, BOARD_LEN)
         for better symbiosis with torch.Tensor.
         """
-        return np.array(self._board.copy(),dtype=bool).reshape((1, BOARD_LEN, BOARD_LEN))
-    
+        return np.array(self._board.copy(),dtype=bool).reshape((1, BOARD_LEN, BOARD_LEN))  # fmt: skip
+
     def in_blocks(self):
-        """ Return currently available block array(3,).
-        """
+        """Return currently available block array(3,)."""
         tmp = self._available.copy()
         for i in range(len(tmp), 3):
             tmp.append(EMPTY_SLOT)
         return np.array(tmp, dtype=np.int8)
 
     def in_streak(self):
-        """Return bool informing about streak, reshaped to array(1,).
-        """
+        """Return bool informing about streak, reshaped to array(1,)."""
         return np.array([self._streak], dtype=bool)
 
     @staticmethod
@@ -153,30 +152,33 @@ class State:
 
     @staticmethod
     def _get_valid_mask(board: np.ndarray, idx: int) -> np.ndarray:
-        """ Return mask of valid positions for placing BLOCKS[idx].
-        """
+        """Return mask of valid positions for placing BLOCKS[idx]."""
         block = BLOCKS[idx]
         valid_mask = np.ones(BOARD_SIZE, dtype=bool)
         n = BOARD_LEN
 
         for dx, dy in block:
+            # fmt: off
             invalid_positions = board[max(0, dx):min(n, n + dx), 
                                     max(0, dy):min(n, n + dy)]
+            # fmt: on
 
             current_valid = np.zeros(BOARD_SIZE, dtype=bool)
+            # fmt: off
             current_valid[max(0, -dx):min(n, n - dx), 
                         max(0, -dy):min(n, n - dy)] = ~invalid_positions
+            # fmt: on
             valid_mask &= current_valid
 
         return valid_mask
 
     def _calculate_strikes(self, block: list, x: int, y: int):
-        """ Calculate clearings of the board, after swipe moves.
-        
+        """Calculate clearings of the board, after swipe moves.
+
         Modify inside state accordingly to those clearings.
 
         Args:
-            block, x, y: Represent placement of a new block on a board. 
+            block, x, y: Represent placement of a new block on a board.
             (Passed in for optimalization purposes)
 
         Returns:
@@ -200,14 +202,14 @@ class State:
                 hit = True
             sq_x = (x0 // 3) * 3
             sq_y = (y0 // 3) * 3
-            if self._board[sq_x:sq_x + 3, sq_y:sq_y + 3].all():
+            if self._board[sq_x : sq_x + 3, sq_y : sq_y + 3].all():
                 hits.add((2, sq_x + sq_y * 8))
                 hit = True
 
-            if not hit: 
+            if not hit:
                 rwrd += 1
             else:
-                streak = True 
+                streak = True
         # Execute clearings.
         for what, id in hits:
             if what == 0:
@@ -217,14 +219,14 @@ class State:
             else:
                 org_x = id % 8
                 org_y = id // 8
-                self._board[org_x:org_x+3, org_y:org_y+3] = False
+                self._board[org_x : org_x + 3, org_y : org_y + 3] = False
         # Calculate reward.
         rwrd += streak * self._streak * State.STREAK_REWARD
         rwrd += len(hits) * State.CLEARING_REWARD
         return rwrd, streak
 
     def calculate_mask(self):
-        """ Calculate legal / illegal mask of all moves from current state.
+        """Calculate legal / illegal mask of all moves from current state.
 
         Value of mask[index] = 0 marks that move encoded as index is illegal.
 
@@ -248,7 +250,7 @@ class State:
         return mask.reshape(NN_OUTPUT_FLAT)
 
     def transition_key(self, piece: int, x: int, y: int):
-        """ Transition state according to given action (piece, x, y).
+        """Transition state according to given action (piece, x, y).
 
         Transition occures in place and reward value of that action is returned.
 
@@ -278,11 +280,11 @@ class State:
 
     def transition(self, piece: int, x: int, y: int):
         """Alike transition_key, but return mask for state'.
-        
+
         More computationally heavy.
 
         Returns:
-            List holding three values - 
+            List holding three values -
             rwrd: Value of reward from transition T(state, action).
             terminal: Whether state' is terminal.
             mask: np.array masking legal moves from state'.
@@ -309,7 +311,7 @@ class State:
             T[i]: - is A[i] terminal.
             B[i]: - state of board after taking action A[i].
             L[i]: - blocks available after taking action A[i].
-            S[i]: - is streak on after action A[i]. 
+            S[i]: - is streak on after action A[i].
         """
         actions = np.flatnonzero(mask).astype(int)
         n_moves = len(actions)
@@ -331,14 +333,14 @@ class State:
         return actions, rewards, terminals, out_boards, out_blocks, out_streaks
 
     def copy(self):
-        """ Get a copy of the State object.
-        """
+        """Get a copy of the State object."""
         new_st = object.__new__(self.__class__)
         new_st._board = self._board.copy()
         new_st._count = self._count
         new_st._available = self._available.copy()
         new_st._streak = self._streak
         return new_st
+
 
 if __name__ == "__main__":
     # x = State()
@@ -367,7 +369,6 @@ if __name__ == "__main__":
 
     print("\n\nREWARD, IS_MOVE_FINISHING, MASK_OF_ILLEGAL_MOVES!")
     print(st.transition(0, 4, 4))
-
 
     print("\n\nAFTERWARDS STATE!")
     print(st._board.astype(int))

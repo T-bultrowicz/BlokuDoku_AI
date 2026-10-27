@@ -4,6 +4,7 @@ from ppadb.client import Client as AdbClient
 import warnings
 import sys
 
+
 def main():
     client = AdbClient(host="127.0.0.1", port=5037)
     print(client.version())
@@ -20,6 +21,7 @@ def main():
         sys.exit(1)
 
     print("All went well!")
+
 
 if __name__ == "__main__":
     warnings.filterwarnings("ignore", category=SyntaxWarning)

@@ -8,8 +8,10 @@ YELLOW = "\033[33m"
 BLUE = "\033[34m"
 GRAY = "\033[90m"
 
+
 def _prints(s: str):
     print(s, end="")
+
 
 def _print_board(board: np.ndarray, is_block: bool = False):
     X, Y = board.shape
@@ -34,6 +36,7 @@ def _print_board(board: np.ndarray, is_block: bool = False):
             print(f"{GRAY} {'-' * (2 * X + (max(0, X - 9)) + (X // 3))}")
     print(f"{DEFAULT_COLOUR}")
 
+
 def _draw_block(arr: np.ndarray, block: list, offset: int = 0):
     min_x, min_y = np.min(block, axis=0)
 
@@ -41,6 +44,7 @@ def _draw_block(arr: np.ndarray, block: list, offset: int = 0):
     arr[fx - min_x + offset, fy - min_y] = 2
     for dx, dy in block[1:]:
         arr[dx - min_x + offset, dy - min_y] = 1
+
 
 def _print_blocks(blocks: np.ndarray):
     arr = np.zeros((18, 5), dtype=np.int8)
@@ -52,25 +56,26 @@ def _print_blocks(blocks: np.ndarray):
         offset += 6
     _print_board(arr, is_block=True)
 
+
 def output_to_player(st: bl.State, score: int, terminal: bool):
-    """ Prints game state to stdout in readeble form.
+    """Prints game state to stdout in readeble form.
 
     Args:
         st: blokudoku_lib.State object.
         score: Score to be displayed.
         terminal: Whether to display game over message.
     """
-    print(f"Score: {score}, streak: {"ON" if st.in_streak() else "OFF"}")
+    print(f"Score: {score}, streak: {'ON' if st.in_streak() else 'OFF'}")
     if terminal:
         print("Game Over!")
     else:
         _print_board(st.in_board().astype(np.int8).squeeze(0))
         _print_blocks(st.in_blocks())
 
+
 def _input_from_player(state: bl.State):
-    """ Receive player input from stdout. Verifies incorrect input.
-    """
-    prompt = "Give number of pawn, then lateral coordinate, finally vertical coordinate: "
+    """Receive player input from stdout. Verifies incorrect input."""
+    prompt = "Give number of pawn, then lateral coordinate, finally vertical coordinate: "  # fmt: skip
     while True:
         try:
             values = list(map(int, input(prompt).split()))
@@ -101,9 +106,9 @@ def _input_from_player(state: bl.State):
 
         return piece, x, y
 
+
 def play_as_player():
-    """ Function that allows to play Bloku Doku game inside terminal.
-    """
+    """Function that allows to play Bloku Doku game inside terminal."""
     state = bl.State()
     game_over = False
     total_score = 0
@@ -111,10 +116,11 @@ def play_as_player():
     while not game_over:
         output_to_player(state, total_score, game_over)
         piece, x, y = _input_from_player(state)
-        rwrd, game_over, _ = state.transition(piece, x, y) 
+        rwrd, game_over, _ = state.transition(piece, x, y)
         total_score += rwrd
     total_score -= bl.NEURAL_PENALTY
     output_to_player(state, total_score, game_over)
+
 
 if __name__ == "__main__":
     play_as_player()

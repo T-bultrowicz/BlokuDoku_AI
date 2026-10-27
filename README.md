@@ -1,6 +1,6 @@
 # Blockudoku AI Agent
 
-An efficient **Deep Q-Learning (DQN)** agent learning to play Blockudoku from scratch. Instead of the classic $Q(s, a)$ approach, the project utilizes an **Afterstate ($V(s')$)** network that evaluates board states after a move, which drastically accelerates convergence and training stability.
+An efficient **Deep Q-Learning (DQN)** agent learning to play Blockudoku from scratch. Instead of the classic $Q(s, a)$ approach, the project utilizes an **Afterstate** ($\mathbf{V(s')}$) network that evaluates board states after a move, which drastically accelerates convergence and training stability.
 
 ### Key Features:
 * **Afterstate Value Network ($V(s')$):** Evaluates the board based on value of post-action states.
@@ -67,18 +67,17 @@ In development
 
 ## Results
 
-| Development stage | Average Score | Model Behavior |
+| Development stage | Average Score | Model Behaviour |
 | :--- | :--- | :--- |
-| **DQN Classic Q(s,a)** | ~300 pts | Baseline. Greedy local choices, lacking spatial planning. |
-| **CNN board transformation** | ~600 pts | Minor score boost, progress still stuck due to large action space. |
-| **V1 Afterstate** | **~2400 pts** | First major breakthrough! Significant tactical improvement, however suffered from catastrophic forgetting. |
-| **Stratify and Aux features (V2)** | ~1500 pts | Regression. Stratified sampling altered in-game state distribution, while auxiliary features disrupted goals of training. |
-| **Different sized architectures** | ~1500 pts | Regression. Smaller models lacked representation capacity, while larger ones overfitted to replay buffer. |
-| **Breaktrough - scheduler** | **~3950 pts** | Learning rate decay stabilized gradients in further steps of learning, allowing tme model to overcome the forgetting problem and further polish long-term strategies. |
+| DQN Classic Q(s,a) | ~300 pts | Baseline. Greedy local choices, lacking spatial planning. |
+| CNN board transformation | ~600 pts | Minor score boost, progress still stuck due to large action space. |
+| V1 Afterstate | **~2400 pts!** | First major breakthrough! Significant tactical improvement, however suffered from catastrophic forgetting. |
+| Stratify and Aux features (V2) | ~1500 pts | Regression. Stratified sampling altered in-game state distribution, while auxiliary features disrupted goals of training. |
+| Different sized architectures | ~1500 pts | Regression. Smaller models lacked representation capacity, while larger ones overfitted to replay buffer. |
+| Breakthrough - scheduler | **~3950 pts!** | Learning rate decay stabilized gradients in further steps of learning, allowing the model to overcome the forgetting problem and further polish long-term strategies. |
 
 ---
 
 ## Author
 
 Project created by **[T-bultrowicz](https://github.com/T-bultrowicz)** as part of experiments with advanced Reinforcement Learning techniques in surprisingly challenging practical application. 
-```
