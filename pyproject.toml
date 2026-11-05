@@ -10,7 +10,29 @@ dependencies = [
     "pandas>=3.0.6",
     "pure-python-adb>=0.3.0.dev0",
     "ruff>=0.17.3",
-    "torch",
+]
+
+# Pick torch build per machine:
+#   uv sync --extra cpu     (no NVIDIA GPU)
+#   uv sync --extra cu130   (NVIDIA GPU, driver supporting CUDA 13.0)
+[project.optional-dependencies]
+cpu = ["torch>=2.14.1"]
+cu130 = ["torch>=2.14.1"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = [".", "tests"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["blokudoku_lib", "network_lib", "reference", "conftest"]
+
+[tool.uv]
+conflicts = [[{ extra = "cpu" }, { extra = "cu130" }]]
+
+[tool.uv.sources]
+torch = [
+    { index = "pytorch-cpu", extra = "cpu" },
+    { index = "pytorch-cu130", extra = "cu130" },
 ]
 
 [[tool.uv.index]]
@@ -18,5 +40,12 @@ name = "pytorch-cpu"
 url = "https://download.pytorch.org/whl/cpu"
 explicit = true
 
-[tool.uv.sources]
-torch = [{ index = "pytorch-cpu" }]
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
+
+[dependency-groups]
+dev = [
+    "pytest>=9.2.0",
+]

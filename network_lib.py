@@ -7,35 +7,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-def _pick_device() -> torch.device:
-    """Pick device for NNs: CUDA, then Apple MPS, then CPU.
-
-    Can be forced with environment variable BLOKUDOKU_DEVICE (e.g. "cpu", "cuda:1").
-    """
-    forced = os.environ.get("BLOKUDOKU_DEVICE")
-    if forced:
-        return torch.device(forced)
-    if torch.cuda.is_available():
-        return torch.device("cuda")
-    if torch.backends.mps.is_available():
-        return torch.device("mps")
-    return torch.device("cpu")
-
-
-DEVICE = _pick_device()
-if DEVICE.type == "cuda":
-    # Input shapes are fixed, let cuDNN pick fastest kernels.
-    torch.backends.cudnn.benchmark = True
-
-
-def to_tensor(arr: np.ndarray, dtype: torch.dtype = torch.float32) -> torch.Tensor:
-    """Convert np.array to tensor of given dtype, placed on DEVICE."""
-    return torch.as_tensor(arr, device=DEVICE).to(dtype)
-
-
 def load_weights(model: nn.Module, filepath: str):
-    """Load state_dict saved on any device into model placed on DEVICE."""
-    model.load_state_dict(torch.load(filepath, map_location=DEVICE, weights_only=True))
+    """Load state_dict saved on any device into model placed on bl.DEVICE."""
+    model.load_state_dict(
+        torch.load(filepath, map_location=bl.DEVICE, weights_only=True)
+    )
 
 
 class ResBlock(nn.Module):
@@ -214,13 +190,13 @@ class BL_DQN_Action_Network_v1(nn.Module):
             while not game_over:
                 board, blocks, streak = st_nw.in_board(), st_nw.in_blocks(), st_nw.in_streak()  # fmt: skip
 
-                nn_board = to_tensor(board).unsqueeze(0)
-                nn_blocks = to_tensor(blocks, torch.long).unsqueeze(0)
-                nn_streak = to_tensor(streak).view(1, 1)
+                nn_board = bl.to_tensor(board).unsqueeze(0)
+                nn_blocks = bl.to_tensor(blocks, torch.long).unsqueeze(0)
+                nn_streak = bl.to_tensor(streak).view(1, 1)
 
                 with torch.no_grad():
                     y_hat_nn = self.forward(nn_board, nn_blocks, nn_streak).squeeze(0)
-                    y_hat_nn[~to_tensor(curr_mask, torch.bool)] = -1e9
+                    y_hat_nn[~bl.to_tensor(curr_mask, torch.bool)] = -1e9
 
                 action = int(torch.argmax(y_hat_nn))
                 piece, x, y = bl.State.decode_action(action)
@@ -385,18 +361,18 @@ class ActionsStorage:
         self.C = c
 
         # fmt: off
-        boards_s = torch.empty((c, 1, bl.BOARD_LEN, bl.BOARD_LEN), dtype=torch.bool, device=DEVICE)
-        blocks_s = torch.empty((c, bl.BLOCKS_TO_PICK), dtype=torch.int8, device=DEVICE)
-        streaks_s = torch.empty((c, 1), dtype=torch.bool, device=DEVICE)
+        boards_s = torch.empty((c, 1, bl.BOARD_LEN, bl.BOARD_LEN), dtype=torch.bool, device=bl.DEVICE)
+        blocks_s = torch.empty((c, bl.BLOCKS_TO_PICK), dtype=torch.int8, device=bl.DEVICE)
+        streaks_s = torch.empty((c, 1), dtype=torch.bool, device=bl.DEVICE)
 
-        boards_f = torch.empty((c, 1, bl.BOARD_LEN, bl.BOARD_LEN), dtype=torch.bool, device=DEVICE)
-        blocks_f = torch.empty((c, bl.BLOCKS_TO_PICK), dtype=torch.int8, device=DEVICE)
-        streaks_f = torch.empty((c, 1), dtype=torch.bool, device=DEVICE)
+        boards_f = torch.empty((c, 1, bl.BOARD_LEN, bl.BOARD_LEN), dtype=torch.bool, device=bl.DEVICE)
+        blocks_f = torch.empty((c, bl.BLOCKS_TO_PICK), dtype=torch.int8, device=bl.DEVICE)
+        streaks_f = torch.empty((c, 1), dtype=torch.bool, device=bl.DEVICE)
 
-        actions = torch.empty(c, dtype=torch.int16, device=DEVICE)
-        rewards = torch.empty(c, dtype=torch.int16, device=DEVICE)
-        terminals = torch.empty(c, dtype=torch.bool, device=DEVICE)
-        masks_f = torch.empty((c, bl.NN_OUTPUT_FLAT), dtype=torch.bool, device=DEVICE)
+        actions = torch.empty(c, dtype=torch.int16, device=bl.DEVICE)
+        rewards = torch.empty(c, dtype=torch.int16, device=bl.DEVICE)
+        terminals = torch.empty(c, dtype=torch.bool, device=bl.DEVICE)
+        masks_f = torch.empty((c, bl.NN_OUTPUT_FLAT), dtype=torch.bool, device=bl.DEVICE)
 
         self.buffers = (
             boards_s, blocks_s, streaks_s,
@@ -430,14 +406,14 @@ class ActionsStorage:
 
         if self.offset + n <= self.C:
             for buf, data in zip(self.buffers, incoming_data):
-                buf[self.offset : self.offset + n] = to_tensor(data, buf.dtype)
+                buf[self.offset : self.offset + n] = bl.to_tensor(data, buf.dtype)
         else:
             space_left = self.C - self.offset
             remainder = n - space_left
 
             for buf, data in zip(self.buffers, incoming_data):
-                buf[self.offset : self.C] = to_tensor(data[:space_left], buf.dtype)
-                buf[0:remainder] = to_tensor(data[space_left:], buf.dtype)
+                buf[self.offset : self.C] = bl.to_tensor(data[:space_left], buf.dtype)
+                buf[0:remainder] = bl.to_tensor(data[space_left:], buf.dtype)
 
         self.offset = (self.offset + n) % self.C
         self.size = min(self.size + n, self.C)
@@ -452,7 +428,7 @@ class ActionsStorage:
             np.arrays representing informations of singular moves, in a same
             order and functionality as described for add_records() method.
         """
-        idx = torch.randint(0, self.size, (num_samples,), device=DEVICE)
+        idx = torch.randint(0, self.size, (num_samples,), device=bl.DEVICE)
         return tuple(buf[idx] for buf in self.buffers)
 
 
@@ -466,21 +442,23 @@ class StateStorage:
     CAPACITY = 1_000_000
 
     def __init__(self, c: int = CAPACITY):
+        if c <= 0:
+            raise ValueError("Size of storage cannot be negative number!")
         self.offset = 0
         self.size = 0
         self.C = c
 
         # fmt: off
-        boards_s = torch.empty((c, 1, bl.BOARD_LEN, bl.BOARD_LEN), dtype=torch.bool, device=DEVICE)
-        blocks_s = torch.empty((c, bl.BLOCKS_TO_PICK), dtype=torch.int8, device=DEVICE)
-        streaks_s = torch.empty((c, 1), dtype=torch.bool, device=DEVICE)
+        boards_s = torch.empty((c, 1, bl.BOARD_LEN, bl.BOARD_LEN), dtype=torch.bool, device=bl.DEVICE)
+        blocks_s = torch.empty((c, bl.BLOCKS_TO_PICK), dtype=torch.int8, device=bl.DEVICE)
+        streaks_s = torch.empty((c, 1), dtype=torch.bool, device=bl.DEVICE)
 
-        boards_f = torch.empty((c, 1, bl.BOARD_LEN, bl.BOARD_LEN), dtype=torch.bool, device=DEVICE)
-        blocks_f = torch.empty((c, bl.BLOCKS_TO_PICK), dtype=torch.int8, device=DEVICE)
-        streaks_f = torch.empty((c, 1), dtype=torch.bool, device=DEVICE)
+        boards_f = torch.empty((c, 1, bl.BOARD_LEN, bl.BOARD_LEN), dtype=torch.bool, device=bl.DEVICE)
+        blocks_f = torch.empty((c, bl.BLOCKS_TO_PICK), dtype=torch.int8, device=bl.DEVICE)
+        streaks_f = torch.empty((c, 1), dtype=torch.bool, device=bl.DEVICE)
 
-        rewards = torch.empty(c, dtype=torch.int16, device=DEVICE)
-        terminals = torch.empty(c, dtype=torch.bool, device=DEVICE)
+        rewards = torch.empty(c, dtype=torch.int16, device=bl.DEVICE)
+        terminals = torch.empty(c, dtype=torch.bool, device=bl.DEVICE)
 
         self.buffers = (
             boards_s, blocks_s, streaks_s,
@@ -489,19 +467,23 @@ class StateStorage:
         )
         # fmt: on
 
-    def add_records(self, boards_s: np.ndarray, blocks_s: np.ndarray, streaks_s: np.ndarray,
-                          boards_f: np.ndarray, blocks_f: np.ndarray, streaks_f: np.ndarray,
-                          rewards: np.ndarray, terminals: np.ndarray):  # fmt: skip
+    def add_records(self, boards_s: bl.TensorLike, blocks_s: bl.TensorLike, streaks_s: bl.TensorLike,
+                          boards_f: bl.TensorLike, blocks_f: bl.TensorLike, streaks_f: bl.TensorLike,
+                          rewards: bl.TensorLike, terminals: bl.TensorLike):  # fmt: skip
         """Add detailed records of singular moves to storage.
+
+        Accepts torch.Tensors (preferably already on bl.DEVICE) or np.arrays.
+        Boards may be passed flat (n, BOARD_FLAT) or as (n, 1, BOARD_LEN, BOARD_LEN).
 
         Args:
             board_s, blocks_s, streaks_s: Pre-action state.
             boards_f, blocks_f, streaks_f: Post-action state.
-            actions: Actions encoded as integers.
             rewards: Rewards from taking actions.
             terminals: Whether post-action state is terminal.
         """
         n = len(boards_s)  # Amount of records to add.
+        if n == 0:
+            return
         # fmt: off
         incoming_data = (
             boards_s, blocks_s, streaks_s,
@@ -509,16 +491,12 @@ class StateStorage:
             rewards, terminals
         )
         # fmt: on
-        if self.offset + n <= self.C:
-            for buf, data in zip(self.buffers, incoming_data):
-                buf[self.offset : self.offset + n] = to_tensor(data, buf.dtype)
-        else:
-            space_left = self.C - self.offset
-            remainder = n - space_left
-
-            for buf, data in zip(self.buffers, incoming_data):
-                buf[self.offset : self.C] = to_tensor(data[:space_left], buf.dtype)
-                buf[0:remainder] = to_tensor(data[space_left:], buf.dtype)
+        # Only the newest C records would survive anyway.
+        skip = max(0, n - self.C)
+        idx = (self.offset + skip + torch.arange(n - skip, device=bl.DEVICE)) % self.C
+        for buf, data in zip(self.buffers, incoming_data):
+            data = bl.to_tensor(data, buf.dtype)[skip:]
+            buf[idx] = data.reshape(-1, *buf.shape[1:])
 
         self.offset = (self.offset + n) % self.C
         self.size = min(self.size + n, self.C)
@@ -530,10 +508,11 @@ class StateStorage:
             num_samples: Size of the sample.
 
         Returns:
-            np.arrays representing informations of singular moves, in a same
-            order and functionality as described for add_records() method.
+            torch.Tensors on bl.DEVICE representing informations of singular
+            moves, in a same order and functionality as described for
+            add_records() method.
         """
-        idx = torch.randint(0, self.size, (num_samples,), device=DEVICE)
+        idx = torch.randint(0, self.size, (num_samples,), device=bl.DEVICE)
         return tuple(buf[idx] for buf in self.buffers)
 
 
@@ -552,6 +531,9 @@ class SmartStateStorage:
     TOTAL_CAPACITY = 1_000_000
     SPLIT = 0.3125
     SMALL_SPLIT = 0.0625
+    BOUNDS = torch.tensor(
+        [EMPTY_BOARDS_MAX, CASUAL_BOARDS_MAX, CROWDED_BOARDS_MAX], device=bl.DEVICE
+    )
 
     def __init__(self):
         casual_size = int(self.TOTAL_CAPACITY * self.SPLIT)
@@ -571,40 +553,40 @@ class SmartStateStorage:
                    self.ultra_crowded_boards.size)
         # fmt: on
 
-    def add_records(self, boards_s: np.ndarray, blocks_s: np.ndarray, streaks_s: np.ndarray,
-                          boards_f: np.ndarray, blocks_f: np.ndarray, streaks_f: np.ndarray,
-                          rewards: np.ndarray, terminals: np.ndarray):  # fmt: skip
+    def add_records(self, boards_s: bl.TensorLike, blocks_s: bl.TensorLike, streaks_s: bl.TensorLike,
+                          boards_f: bl.TensorLike, blocks_f: bl.TensorLike, streaks_f: bl.TensorLike,
+                          rewards: bl.TensorLike, terminals: bl.TensorLike):  # fmt: skip
         """Add detailed records of singular moves to storage.
+
+        Accepts torch.Tensors (preferably already on bl.DEVICE) or np.arrays.
 
         Args:
             board_s, blocks_s, streaks_s: Pre-action state.
             boards_f, blocks_f, streaks_f: Post-action state.
-            actions: Actions encoded as integers.
             rewards: Rewards from taking actions.
             terminals: Whether post-action state is terminal.
         """
-        board_counts = np.sum(boards_s.reshape(len(boards_s), -1), axis=1)
-        empty_mask = board_counts <= self.EMPTY_BOARDS_MAX
+        # Move everything to device once, so masking below happens there.
         # fmt: off
-        casual_mask = (board_counts > self.EMPTY_BOARDS_MAX) & (board_counts <= self.CASUAL_BOARDS_MAX)
-        crowded_mask = (board_counts > self.CASUAL_BOARDS_MAX) & (board_counts <= self.CROWDED_BOARDS_MAX) 
+        incoming_data = tuple(
+            bl.to_tensor(data, buf.dtype) for buf, data in zip(
+                self.empty_boards.buffers,
+                (boards_s, blocks_s, streaks_s,
+                 boards_f, blocks_f, streaks_f,
+                 rewards, terminals)
+            )
+        )
         # fmt: on
-        ultra_crowded_mask = board_counts > self.CROWDED_BOARDS_MAX
+        boards = incoming_data[0]
+        board_counts = boards.reshape(len(boards), -1).sum(dim=1)
+        # Bucket i holds boards with BOUNDS[i-1] < count <= BOUNDS[i].
+        buckets = torch.bucketize(board_counts, self.BOUNDS.to(board_counts.dtype))
 
-        def push(storage_obj, mask):
-            if np.any(mask):
-                # fmt: off
-                storage_obj.add_records(
-                    boards_s[mask], blocks_s[mask], streaks_s[mask],
-                    boards_f[mask], blocks_f[mask], streaks_f[mask],
-                    rewards[mask], terminals[mask]
-                )
-                # fmt: on
-
-        push(self.empty_boards, empty_mask)
-        push(self.casual_boards, casual_mask)
-        push(self.crowded_boards, crowded_mask)
-        push(self.ultra_crowded_boards, ultra_crowded_mask)
+        storages = (self.empty_boards, self.casual_boards,
+                    self.crowded_boards, self.ultra_crowded_boards)  # fmt: skip
+        for i, storage_obj in enumerate(storages):
+            mask = buckets == i
+            storage_obj.add_records(*(data[mask] for data in incoming_data))
 
     def sample(self, num_samples: int = 1):
         """Randomly sample games from storage, following stratified distribution
@@ -614,8 +596,9 @@ class SmartStateStorage:
             num_samples: Size of the sample.
 
         Returns:
-            np.arrays representing informations of singular moves, in a same
-            order and functionality as described for add_records() method.
+            torch.Tensors on bl.DEVICE representing informations of singular
+            moves, in a same order and functionality as described for
+            add_records() method.
         """
         part = int(num_samples * self.SPLIT)
         s1 = self.empty_boards.sample(part)

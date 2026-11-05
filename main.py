@@ -13,11 +13,13 @@ import copy
 
 # DEVICE DEPENDENT PARAMETRES
 (GAMES_IN_PARALLEL, EXCHANGE_NETS_FREQ, BATCH_SIZE) = (
-    (64, 60, 512) if net.DEVICE.type == "cuda" else (16, 250, 128)
+    (64, 60, 512) if bl.DEVICE.type == "cuda" else (16, 250, 128)
 )
 
 # LONGEVITY OF TRAINING AND VALIDATION INTERVAL PARAMETERS
-GAMES_TO_PLAY = 60_000
+GAMES_TO_PLAY_TRAIN = 60_000
+GAMES_TO_PLAY_TEST = 500
+GAMES_TO_PLAY_PROFILE = 3_000
 DISPLAY_ERR_FREQ = 1500
 GAMES_TO_DISPLAY_INFO = 250
 VALIDATION_GAMES_PER_BATCH = 5
@@ -147,16 +149,16 @@ def val_state_net(netw: nn.Module, games_count: int = 100, more_info: bool = Fal
             actions, rewards, _, boards, blocks, streaks = cur_state.all_1move_states(mask)
             # fmt: on
 
-            nn_board = net.to_tensor(boards)
-            nn_blocks = net.to_tensor(blocks, torch.long)
-            nn_streak = net.to_tensor(streaks).view(-1, 1)
+            nn_board = bl.to_tensor(boards)
+            nn_blocks = bl.to_tensor(blocks, torch.long)
+            nn_streak = bl.to_tensor(streaks).view(-1, 1)
 
             with torch.no_grad():
                 out = netw(nn_board, nn_blocks, nn_streak)
                 v_values = (
                     out[0].squeeze(-1) if isinstance(out, tuple) else out.squeeze(-1)
                 )
-                y_hat_nn = v_values + net.to_tensor(rewards)
+                y_hat_nn = v_values + bl.to_tensor(rewards)
 
             best_idx = int(torch.argmax(y_hat_nn))
             best_action_encoded = actions[best_idx]
@@ -239,9 +241,9 @@ class ActionNetworkTrainer:
         )
 
     @staticmethod
-    def test_network():
-        """Tests netowork on 100 games."""
-        main_net = net.BL_DQN_Action_Network_v1().to(net.DEVICE)
+    def test_network(games_to_play: int = GAMES_TO_PLAY_TEST):
+        """Tests netowork on games_to_play games."""
+        main_net = net.BL_DQN_Action_Network_v1().to(bl.DEVICE)
 
         try:
             net.load_weights(main_net, ActionNetworkTrainer.SAVE_PATH)
@@ -251,7 +253,7 @@ class ActionNetworkTrainer:
             )
             return
 
-        main_net.validate_model(100)
+        print(main_net.validate_model(games_to_play))
 
     @staticmethod
     def _play_parallel_games(
@@ -266,13 +268,13 @@ class ActionNetworkTrainer:
         blocks = [st.in_blocks() for st in states]
         streaks = [st.in_streak() for st in states]
 
-        nn_boards = net.to_tensor(np.array(boards))
-        nn_blocks = net.to_tensor(np.array(blocks), torch.long)
-        nn_streaks = net.to_tensor(np.array(streaks))
+        nn_boards = bl.to_tensor(np.array(boards))
+        nn_blocks = bl.to_tensor(np.array(blocks), torch.long)
+        nn_streaks = bl.to_tensor(np.array(streaks))
 
         with torch.no_grad():
             y_hat_nn = main_net(nn_boards, nn_blocks, nn_streaks)
-            y_hat_nn[~net.to_tensor(masks, torch.bool)] = -1e9
+            y_hat_nn[~bl.to_tensor(masks, torch.bool)] = -1e9
             best_actions = torch.argmax(y_hat_nn, dim=1).tolist()
 
         decisions = [bl.rng_fact_instance.explore_now(eps) for _ in range(games_count)]
@@ -379,16 +381,18 @@ class ActionNetworkTrainer:
         return games_played_mod % GAMES_TO_DISPLAY_INFO, time.perf_counter()
 
     @staticmethod
-    def train_action_network(games_count: int = GAMES_IN_PARALLEL):
-        """Trains network on games_count games being played in parallel.
+    def train_action_network(
+        games_to_play: int = GAMES_TO_PLAY_TRAIN, games_count: int = GAMES_IN_PARALLEL
+    ):
+        """Trains network for games_to_play games, games_count of them being played in parallel.
 
         IMPORTANT: Changing games_count also requires to change global variable
         BATCH_SIZE to preserve same ratio of forward_moves / learning_moves ratio.
         Games_count equal 16 was tested to be optimal for speed on my device.
 
         """
-        main_net = net.BL_DQN_Action_Network_v1().to(net.DEVICE)
-        target_net = net.BL_DQN_Action_Network_v1().to(net.DEVICE)
+        main_net = net.BL_DQN_Action_Network_v1().to(bl.DEVICE)
+        target_net = net.BL_DQN_Action_Network_v1().to(bl.DEVICE)
         storage = net.ActionsStorage()
 
         optimizer = torch.optim.Adam(main_net.parameters(), lr=LEARING_OPTIM_RATE)
@@ -399,7 +403,7 @@ class ActionNetworkTrainer:
         games_played = 0
         games_played_mod = 0
         loops = 0
-        while games_played < GAMES_TO_PLAY:
+        while games_played < games_to_play:
             terminals = ActionNetworkTrainer._play_parallel_games(
                 states, main_net, storage, eps, games_count
             )
@@ -430,17 +434,16 @@ class StateNetworkTrainer:
     SAVE_PATH_NET = "state_network_v1.pt"
     SAVE_PATH_SCORE = "best_score.txt"
 
-    @classmethod
-    def showcase_network(cls):
+    def showcase_network(self):
         """Interactive display in terminal (stdout), of how network saved under
         SAVE_PATH_NET plays the game.
         """
-        main_net, _, _ = cls._get_components()
+        main_net, _, _ = self._get_components()
         try:
-            net.load_weights(main_net, cls.SAVE_PATH_NET)
+            net.load_weights(main_net, self.SAVE_PATH_NET)
         except Exception as e:
             print(
-                f"Error - didn't managed to find network params in filepath{cls.SAVE_PATH_NET}\n"
+                f"Error - didn't managed to find network params in filepath{self.SAVE_PATH_NET}\n"
             )
             return
 
@@ -452,13 +455,13 @@ class StateNetworkTrainer:
             user_play.output_to_player(state, score, game_over)
             # fmt: off
             (a_actions, a_rewards, a_terminals, a_boards,
-             a_blocks, a_streaks, lengths) = cls._gather_data([state], [state.calculate_mask()])
+             a_blocks, a_streaks, lengths) = self._gather_data([state], [state.calculate_mask()])
             # fmt: on
 
-            q_per_game = cls._forward_data(
+            q_per_game = self._forward_data(
                 a_rewards, a_terminals, a_boards, a_blocks, a_streaks, main_net
             )
-            chosen_actions = cls._agent_decide(q_per_game, a_actions, 0.0, lengths)
+            chosen_actions = self._agent_decide(q_per_game, a_actions, 0.0, lengths)
             rwrd, game_over, _ = state.transition(
                 *bl.State.decode_action(a_actions[0][chosen_actions[0]])
             )
@@ -467,34 +470,34 @@ class StateNetworkTrainer:
 
         user_play.output_to_player(state, score, game_over)
 
-    @classmethod
-    def test_network(cls, games_count: int = 100):
-        """Validate network on the set of games_count games. Print result to stdout."""
-        main_net, _, _ = cls._get_components()
+    def test_network(self, games_to_play: int = GAMES_TO_PLAY_TEST):
+        """Validate network on the set of games_to_play games. Print result to stdout."""
+        main_net, _, _ = self._get_components()
         try:
-            net.load_weights(main_net, cls.SAVE_PATH_NET)
+            net.load_weights(main_net, self.SAVE_PATH_NET)
         except Exception as e:
             print(
-                f"Error - didn't managed to find network params in filepath{cls.SAVE_PATH_NET}\n"
+                f"Error - didn't managed to find network params in filepath{self.SAVE_PATH_NET}\n"
             )
             return
 
-        score, score_std, max, min = val_state_net(main_net, games_count, True)  # type: ignore
+        score, score_std, max, min = val_state_net(main_net, games_to_play, True)  # type: ignore
         print(
             f"Tested model performance - mean score: {score:.2f}, std: {score_std:.2f}, \
 max:{max:.4f}, min:{min:.4f}"
         )
 
-    @classmethod
-    def _get_components(cls):
+    def _get_components(self):
         return (
-            net.BL_DQN_State_Network_v1(net.BL_DQN_State_Network()).to(net.DEVICE),
-            net.BL_DQN_State_Network_v1(net.BL_DQN_State_Network()).to(net.DEVICE),
+            net.BL_DQN_State_Network_v1(net.BL_DQN_State_Network()).to(bl.DEVICE),
+            net.BL_DQN_State_Network_v1(net.BL_DQN_State_Network()).to(bl.DEVICE),
             net.StateStorage(),
         )
 
-    @classmethod
-    def _gather_data(cls, states: list, masks: list):
+    def _get_optimizer(self, net: nn.Module, lr: float, weight_decay: float = 1e-4):
+        return torch.optim.Adam(net.parameters(), lr=lr)
+
+    def _gather_data(self, states: list, masks: list):
         # fmt: off
         (all_actions, all_rewards, all_terminals,
          all_boards, all_blocks, all_streaks) = [], [], [], [], [], []
@@ -518,9 +521,8 @@ max:{max:.4f}, min:{min:.4f}"
                 all_boards, all_blocks, all_streaks, lengths)
         # fmt: on
 
-    @classmethod
     def _forward_data(
-        cls,
+        self,
         rewards: list,
         terminals: list,
         boards: list,
@@ -528,11 +530,11 @@ max:{max:.4f}, min:{min:.4f}"
         streaks: list,
         nn_net: nn.Module,
     ):
-        mega_rewards = net.to_tensor(np.concatenate(rewards))
-        mega_terminals = net.to_tensor(np.concatenate(terminals))
-        mega_nn_boards = net.to_tensor(np.concatenate(boards))
-        mega_nn_blocks = net.to_tensor(np.concatenate(blocks), torch.long)
-        mega_nn_streaks = net.to_tensor(np.concatenate(streaks))
+        mega_rewards = bl.to_tensor(np.concatenate(rewards))
+        mega_terminals = bl.to_tensor(np.concatenate(terminals))
+        mega_nn_boards = bl.to_tensor(np.concatenate(boards))
+        mega_nn_blocks = bl.to_tensor(np.concatenate(blocks), torch.long)
+        mega_nn_streaks = bl.to_tensor(np.concatenate(streaks))
 
         with torch.no_grad():
             out = nn_net(mega_nn_boards, mega_nn_blocks, mega_nn_streaks)
@@ -541,8 +543,7 @@ max:{max:.4f}, min:{min:.4f}"
         q_values = mega_rewards + (1 - mega_terminals) * DISCOUNT * v_values
         return q_values
 
-    @classmethod
-    def _agent_decide(cls, qs: torch.Tensor, act: list, eps: float, lengths: list):
+    def _agent_decide(self, qs: torch.Tensor, act: list, eps: float, lengths: list):
         n = len(lengths)
         choices = np.empty(n, dtype=np.int16)
         explorations = [bl.rng_fact_instance.explore_now(eps) for _ in range(n)]
@@ -555,9 +556,8 @@ max:{max:.4f}, min:{min:.4f}"
                 choices[i] = int(np.argmax(per_game[i]))
         return choices
 
-    @classmethod
     def _env_update(
-        cls,
+        self,
         states: list,
         masks: list,
         chosen_actions: np.ndarray,
@@ -591,9 +591,8 @@ max:{max:.4f}, min:{min:.4f}"
                 masks[i] = states[i].calculate_mask()
         return states, masks, np.sum(terminals)
 
-    @classmethod
     def _perform_gradient_descent(
-        cls,
+        self,
         main_net: nn.Module,
         target_net: nn.Module,
         storage,
@@ -620,15 +619,14 @@ max:{max:.4f}, min:{min:.4f}"
             ).squeeze(1)
 
         target_fn = b_rewards + (1 - b_terminals) * DISCOUNT * y_hat_nn_target
-        losses = F.mse_loss(y_hat_nn_main, target_fn)
+        losses = F.smooth_l1_loss(y_hat_nn_main, target_fn)
 
         optimizer.zero_grad()
         losses.backward()
         optimizer.step()
 
-    @classmethod
     def _display_info(
-        cls, games: int, games_mod: int, start: float, eps: float, main_net: nn.Module
+        self, games: int, games_mod: int, start: float, eps: float, main_net: nn.Module
     ):
         if games_mod < GAMES_TO_DISPLAY_INFO or games == 0:
             return games_mod, start
@@ -647,24 +645,27 @@ max:{max:.4f}, min:{min:.4f}"
 
         try_write_best_net(
             main_net,
-            cls.SAVE_PATH_NET,
-            cls.SAVE_PATH_SCORE,
+            self.SAVE_PATH_NET,
+            self.SAVE_PATH_SCORE,
             VALIDATION_GAMES_PER_FIGHT,
             score,
         )
         return games_mod % GAMES_TO_DISPLAY_INFO, time.perf_counter()
 
-    @classmethod
-    def train_state_network(cls, games_count: int = GAMES_IN_PARALLEL):
-        """Trains network on games_count games being played in parallel.
+    def train_state_network(
+        self,
+        games_to_play: int = GAMES_TO_PLAY_TRAIN,
+        games_count: int = GAMES_IN_PARALLEL,
+    ):
+        """Trains network for games_to_play games, games_count of them being played in parallel.
 
         IMPORTANT: Changing games_count also requires to change global variable
         BATCH_SIZE to preserve same ratio of forward_moves / learning_moves ratio.
         Games_count equal 16 was tested to be optimal for speed on my device.
 
         """
-        main_net, target_net, storage = cls._get_components()
-        optimizer = torch.optim.Adam(main_net.parameters(), lr=LEARING_OPTIM_RATE)
+        main_net, target_net, storage = self._get_components()
+        optimizer = self._get_optimizer(main_net, LEARING_OPTIM_RATE)
         scheduler = torch.optim.lr_scheduler.StepLR(
             optimizer, step_size=STEP_TO_MODIFY, gamma=GAMMA
         )
@@ -676,23 +677,23 @@ max:{max:.4f}, min:{min:.4f}"
         games_played = 0
         games_played_mod = 0
         loops = 0
-        while games_played < GAMES_TO_PLAY:
+        while games_played < games_to_play:
             # GATHER MOVES
             # fmt: off
             (a_actions, a_rewards, a_terminals, a_boards,
-             a_blocks, a_streaks, lengths) = cls._gather_data(states, masks)
+             a_blocks, a_streaks, lengths) = self._gather_data(states, masks)
             # fmt: on
 
-            q_per_game = cls._forward_data(
+            q_per_game = self._forward_data(
                 a_rewards, a_terminals, a_boards, a_blocks, a_streaks, main_net
             )
-            chosen_actions = cls._agent_decide(q_per_game, a_actions, eps, lengths)
+            chosen_actions = self._agent_decide(q_per_game, a_actions, eps, lengths)
 
-            states, masks, term_sum = cls._env_update(
+            states, masks, term_sum = self._env_update(
                 states, masks, chosen_actions, storage, a_actions
             )
 
-            cls._perform_gradient_descent(
+            self._perform_gradient_descent(
                 main_net, target_net, storage, optimizer, loops % DISPLAY_ERR_FREQ == 0
             )
 
@@ -702,7 +703,7 @@ max:{max:.4f}, min:{min:.4f}"
             for _ in range(term_sum):
                 scheduler.step()
             eps = max(EPS_MIN, eps * (DECAY_RATE**games_count))
-            games_played_mod, batch_start_time = cls._display_info(
+            games_played_mod, batch_start_time = self._display_info(
                 games_played, games_played_mod, batch_start_time, eps, main_net
             )
 
@@ -720,19 +721,17 @@ class AdvancedTrainer(StateNetworkTrainer):
     SAVE_PATH_SCORE = "best_score_v2.txt"
     NUM_AUX = 5
 
-    @classmethod
-    def _get_components(cls):  # type: ignore
+    def _get_components(self):  # type: ignore
         # fmt: off
         return (
-            net.BL_DQN_State_Network_v2(net.BL_DQN_State_Network(), cls.NUM_AUX).to(net.DEVICE),
-            net.BL_DQN_State_Network_v2(net.BL_DQN_State_Network(), cls.NUM_AUX).to(net.DEVICE),
+            net.BL_DQN_State_Network_v2(net.BL_DQN_State_Network(), self.NUM_AUX).to(bl.DEVICE),
+            net.BL_DQN_State_Network_v2(net.BL_DQN_State_Network(), self.NUM_AUX).to(bl.DEVICE),
             net.SmartStateStorage(),
         )
         # fmt: on
 
-    @classmethod
     def _perform_gradient_descent(
-        cls, main_net, target_net, storage, optimizer, display_err: bool = False
+        self, main_net, target_net, storage, optimizer, display_err: bool = False
     ):
         if storage.size < BATCH_SIZE:
             return
@@ -772,12 +771,11 @@ class LightTrainer(StateNetworkTrainer):
     SAVE_PATH_NET = "state_network_light.pt"
     SAVE_PATH_SCORE = "best_score_light.txt"
 
-    @classmethod
-    def _get_components(cls):  # type: ignore
+    def _get_components(self):  # type: ignore
         # fmt: off
         return (
-            net.BL_DQN_State_Network_v1(net.BL_DQN_State_Network_Light()).to(net.DEVICE),
-            net.BL_DQN_State_Network_v1(net.BL_DQN_State_Network_Light()).to(net.DEVICE),
+            net.BL_DQN_State_Network_v1(net.BL_DQN_State_Network_Light()).to(bl.DEVICE),
+            net.BL_DQN_State_Network_v1(net.BL_DQN_State_Network_Light()).to(bl.DEVICE),
             net.StateStorage(),
         )
         # fmt: on
@@ -789,19 +787,107 @@ class HeavyTrainer(StateNetworkTrainer):
     SAVE_PATH_NET = "state_network_heavy.pt"
     SAVE_PATH_SCORE = "best_score_heavy.txt"
 
-    @classmethod
-    def _get_components(cls):  # type: ignore
+    def _get_components(self):  # type: ignore
         # fmt: off
         return (
-            net.BL_DQN_State_Network_v1(net.BL_DQN_State_Network_Heavy()).to(net.DEVICE),
-            net.BL_DQN_State_Network_v1(net.BL_DQN_State_Network_Heavy()).to(net.DEVICE),
+            net.BL_DQN_State_Network_v1(net.BL_DQN_State_Network_Heavy()).to(bl.DEVICE),
+            net.BL_DQN_State_Network_v1(net.BL_DQN_State_Network_Heavy()).to(bl.DEVICE),
             net.StateStorage(),
         )
         # fmt: on
 
+    def _get_optimizer(self, net: nn.Module, lr: float, weight_decay: float = 1e-4):
+        decay, no_decay = [], []
+        for name, p in net.named_parameters():
+            if p.ndim <= 1 or "embed" in name:  # biasy (1D) i embeddingi
+                no_decay.append(p)
+            else:
+                decay.append(p)
+        return torch.optim.AdamW(
+            [
+                {"params": decay, "weight_decay": weight_decay},
+                {"params": no_decay, "weight_decay": 0.0},
+            ],
+            lr=lr,
+        )
 
-# TODO - add options to switch between models for user, via console.
+
+from collections import defaultdict
+
+
+class TimedMixin:
+    """Helper class to run diagnostics on what parts of code are the slowest.
+
+    To use mix inheritance from TimedMixin and one of Statetrainers. Run code
+    to be tested, collect results from class attribute - self.T dictionary.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.T = defaultdict(float)
+
+    class _timed:
+        def __init__(self, name: str, T: dict) -> None:
+            self.name = name
+            self.T = T
+
+        def __enter__(self):
+            if bl.DEVICE.type == "cuda":
+                torch.cuda.synchronize()
+            self.t = time.perf_counter()
+
+        def __exit__(self, *a):
+            if bl.DEVICE.type == "cuda":
+                torch.cuda.synchronize()
+            self.T[self.name] += time.perf_counter() - self.t
+
+    def _forward_data(self, *args, **kwargs):
+        with self._timed("forward", self.T):
+            return super()._forward_data(*args, **kwargs)  # type: ignore
+
+    def _gather_data(self, *args, **kwargs):
+        with self._timed("gather", self.T):
+            return super()._gather_data(*args, **kwargs)  # type: ignore
+
+    def _agent_decide(self, *args, **kwargs):
+        with self._timed("agent_decision", self.T):
+            return super()._agent_decide(*args, **kwargs)  # type: ignore
+
+    def _perform_gradient_descent(self, *args, **kwargs):
+        with self._timed("backprop", self.T):
+            return super()._perform_gradient_descent(*args, **kwargs)  # type: ignore
+
+    def _env_update(self, *args, **kwargs):
+        with self._timed("env_update", self.T):
+            return super()._env_update(*args, **kwargs)  # type: ignore
+
+
+class T_StateNetworkTrainer(TimedMixin, StateNetworkTrainer):
+    pass
+
+
+class T_AdvancedTrainer(TimedMixin, AdvancedTrainer):
+    pass
+
+
+class T_LightTrainer(TimedMixin, LightTrainer):
+    pass
+
+
+class T_HeavyTrainer(TimedMixin, HeavyTrainer):
+    pass
+
+
+class T_ActionNetworkTrainer:
+    def __init__(self) -> None:
+        raise RuntimeError(
+            "Showcase network is not yet implemented for action network! \
+(Sorry for the inconvenience)"
+        )
+
+
 def main(args):
+    torch.manual_seed(bl.DEF_SEED)
     if len(args) < 2:
         print("Please provide a command! Use command 'usage' for help!")
         return 0
@@ -809,13 +895,16 @@ def main(args):
     if args[1] == "usage":
         print(
             """
-    Calling convention: <{python3 / uv run / python}> <execpath> <command> <model (optional)> 
+    Calling convention: <{python3 / uv run / python}> <execpath> <command> <model (optional)> <games (optional)>
+
+    games: number of games to play, defaults are 60000 (train), 500 (test), 3000 (time_profile).
 
     Commands available for blokudoku_AI:
     train: trains the AI model
     test: tests the AI model
     play_as_player: play the game as a player, to compare score with the AI
     watch_ai_play: AI plays slowly, so you can watch it play
+    time_profile: Performance measurements towards optimalization
 
     Models available for training and testing:
     casual: BL_DQN_State_Network_v1 model (BEST RESULTS by far, recommended)
@@ -835,21 +924,36 @@ def main(args):
         user_play.play_as_player()
         return 0
 
-    if args[1] not in ["train", "test", "watch_ai_play"]:
+    if args[1] not in ["train", "test", "watch_ai_play", "time_profile"]:
         print(f"Unrecognised argument: '{args[1]}'! Use command 'usage' for help! ")
         return 0
-    if len(args) != 3:
+    if len(args) not in (3, 4):
         print(
             f"Please provide a command and a model name! Use command 'usage' for help!"
         )
         return 0
 
+    default_games = {
+        "train": GAMES_TO_PLAY_TRAIN,
+        "test": GAMES_TO_PLAY_TEST,
+        "time_profile": GAMES_TO_PLAY_PROFILE,
+    }
+    games_to_play = default_games.get(args[1], 0)
+    if len(args) == 4:
+        try:
+            games_to_play = int(args[3])
+        except ValueError:
+            games_to_play = 0
+        if games_to_play <= 0:
+            print(f"Number of games must be a positive integer, got: '{args[3]}'!")
+            return 0
+
     models = {
-        "casual": StateNetworkTrainer,
-        "advanced": AdvancedTrainer,
-        "light": LightTrainer,
-        "heavy": HeavyTrainer,
-        "action": ActionNetworkTrainer,
+        "casual": StateNetworkTrainer(),
+        "advanced": AdvancedTrainer(),
+        "light": LightTrainer(),
+        "heavy": HeavyTrainer(),
+        "action": ActionNetworkTrainer(),
     }
     if args[2] not in models.keys():
         print(f"Unrecognised model: '{args[2]}'! Use command 'usage' for help! ")
@@ -857,14 +961,40 @@ def main(args):
     trainer = models[args[2]]
 
     if args[1] == "train":
-        if trainer is ActionNetworkTrainer:
-            ActionNetworkTrainer.train_action_network()
+        if isinstance(trainer, ActionNetworkTrainer):
+            trainer.train_action_network(games_to_play)
         else:
-            trainer.train_state_network()
+            trainer.train_state_network(games_to_play)
     elif args[1] == "test":
-        trainer.test_network()
+        trainer.test_network(games_to_play)
     elif args[1] == "watch_ai_play":
         trainer.showcase_network()
+    elif args[1] == "time_profile":
+        timed_models = {
+            "casual": T_StateNetworkTrainer,
+            "advanced": T_AdvancedTrainer,
+            "light": T_LightTrainer,
+            "heavy": T_HeavyTrainer,
+            "action": T_ActionNetworkTrainer,
+        }
+        trainer = timed_models[args[2]]()
+        print(f"Beginning diagnostics on {games_to_play} games of training!")
+
+        t_start = time.perf_counter()
+        trainer.train_state_network(games_to_play)
+        t_total = time.perf_counter() - t_start
+        t_rest = 0.0
+        for key, val in trainer.T.items():
+            t_rest += val
+            print(
+                f"Function {key} took ~{(val * 100 / t_total):.2f}"
+                + " percents of whole code execution!"
+            )
+
+        print(
+            f"Rest of code took: ~{((t_total - t_rest) * 100 / t_total):.2f}"
+            + " percents."
+        )
 
 
 if __name__ == "__main__":
