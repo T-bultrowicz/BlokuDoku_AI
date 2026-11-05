@@ -3,13 +3,9 @@
 Run: uv run python benchmarks/legal_moves.py
 """
 
-import sys
-from pathlib import Path
-
 import torch
 from torch.utils import benchmark
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import blokudoku_lib as bl
 
 

@@ -1,7 +1,8 @@
-import numpy as np
-import random as rand
-import torch
 import os
+import random as rand
+
+import numpy as np
+import torch
 
 """ Constants around Bloku Doku game logic """
 

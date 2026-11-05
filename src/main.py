@@ -10,6 +10,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import copy
+from pathlib import Path
+
+# Weights and best scores live here, no matter the current working directory.
+NETWORKS_DIR = Path(__file__).resolve().parents[1] / "networks"
+NETWORKS_DIR.mkdir(exist_ok=True)
 
 # DEVICE DEPENDENT PARAMETRES
 (GAMES_IN_PARALLEL, EXCHANGE_NETS_FREQ, BATCH_SIZE) = (
@@ -231,7 +236,7 @@ class ActionNetworkTrainer:
     feel free to overwrite if different path is desired.
     """
 
-    SAVE_PATH = "action_network_v1.pt"
+    SAVE_PATH = NETWORKS_DIR / "action_network_v1.pt"
 
     @staticmethod
     def showcase_network():
@@ -431,8 +436,8 @@ class ActionNetworkTrainer:
 class StateNetworkTrainer:
     """Class for working with default BL_DQN_State_Network_v1() NN model."""
 
-    SAVE_PATH_NET = "state_network_v1.pt"
-    SAVE_PATH_SCORE = "best_score.txt"
+    SAVE_PATH_NET = NETWORKS_DIR / "state_network_v1.pt"
+    SAVE_PATH_SCORE = NETWORKS_DIR / "best_score.txt"
 
     def showcase_network(self):
         """Interactive display in terminal (stdout), of how network saved under
@@ -717,8 +722,8 @@ class AdvancedTrainer(StateNetworkTrainer):
     with default - medium size.
     """
 
-    SAVE_PATH_NET = "state_network_v2.pt"
-    SAVE_PATH_SCORE = "best_score_v2.txt"
+    SAVE_PATH_NET = NETWORKS_DIR / "state_network_v2.pt"
+    SAVE_PATH_SCORE = NETWORKS_DIR / "best_score_v2.txt"
     NUM_AUX = 5
 
     def _get_components(self):  # type: ignore
@@ -768,8 +773,8 @@ class AdvancedTrainer(StateNetworkTrainer):
 class LightTrainer(StateNetworkTrainer):
     """Class for working with BL_DQN_State_Network_v1() light version model."""
 
-    SAVE_PATH_NET = "state_network_light.pt"
-    SAVE_PATH_SCORE = "best_score_light.txt"
+    SAVE_PATH_NET = NETWORKS_DIR / "state_network_light.pt"
+    SAVE_PATH_SCORE = NETWORKS_DIR / "best_score_light.txt"
 
     def _get_components(self):  # type: ignore
         # fmt: off
@@ -784,8 +789,8 @@ class LightTrainer(StateNetworkTrainer):
 class HeavyTrainer(StateNetworkTrainer):
     """Class for working with BL_DQN_State_Network_v1() heavy version model."""
 
-    SAVE_PATH_NET = "state_network_heavy.pt"
-    SAVE_PATH_SCORE = "best_score_heavy.txt"
+    SAVE_PATH_NET = NETWORKS_DIR / "state_network_heavy.pt"
+    SAVE_PATH_SCORE = NETWORKS_DIR / "best_score_heavy.txt"
 
     def _get_components(self):  # type: ignore
         # fmt: off
@@ -914,8 +919,8 @@ def main(args):
     heavy: BL_DQN_State_Network_Heavy model (very overfitting, not recommended)
     action: BL_DQN_Action_Network_v1 model (very bad results, not recommended)
 
-    To alter pathfiles for saving NNs, change SAVE_PATH_NET, SAVE_PATH_SCORE
-    inside classes of main.py.
+    Networks and their best scores are saved under networks/. To alter
+    filenames, change SAVE_PATH_NET, SAVE_PATH_SCORE inside classes of main.py.
     """
         )
         return 0
@@ -997,5 +1002,10 @@ def main(args):
         )
 
 
-if __name__ == "__main__":
+def cli():
+    """Entry point of the `blokudoku` command (see [project.scripts])."""
     main(sys.argv)
+
+
+if __name__ == "__main__":
+    cli()

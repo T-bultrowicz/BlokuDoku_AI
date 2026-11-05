@@ -16,12 +16,15 @@ An efficient **Deep Q-Learning (DQN)** agent learning to play Blockudoku from sc
 ## Project Structure
 
 ```text
-├── blokudoku_lib.py     # Game engine, state generation, and action masks
-├── network_lib.py       # Neural network architectures (ResNet, V1, V2, Light)
-├── trainers.py          # Training loops, optimizers, and buffer handling
-├── user_play.py         # Module allowing manual human gameplay
-├── automatisation.py    # Module allowing automated play on android device (in development)
-└── main.py              # CLI entry point
+├── src/
+│   ├── blokudoku_lib.py   # Game engine (VectorizedStates), action masks
+│   ├── network_lib.py     # Neural network architectures and replay storages
+│   ├── main.py            # Trainers and CLI entry point (`blokudoku` command)
+│   ├── user_play.py       # Module allowing manual human gameplay
+│   └── automatisation.py  # Automated play on android device (in development)
+├── networks/              # Saved weights (*.pt) and their best scores (*.txt)
+├── tests/                 # pytest suite (`uv run pytest`)
+└── benchmarks/            # Speed comparisons, not part of the test suite
 ```
 
 ---
@@ -46,15 +49,15 @@ The project is operated via the command line interface:
 
 * **Train / test the agent:**
   ```bash
-  uv run main.py [train / test] [NN_type (casual / heavy / light / advanced / action)]
+  uv run blokudoku [train / test] [NN_type (casual / heavy / light / advanced / action)]
   ```
 * **Manual play (compare score with AI):**
   ```bash
-  uv run main.py play_as_player
+  uv run blokudoku play_as_player
   ```
 * **Help and available options:**
   ```bash
-  uv run main.py usage
+  uv run blokudoku usage
   ```
 
 ---
