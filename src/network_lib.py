@@ -1,16 +1,20 @@
 import blokudoku_lib as bl
 
-import numpy as np
 import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from pathlib import Path
 
+def load_weights(model: nn.Module, filepath: str | Path):
+    """Load state_dict saved on any device into model placed on bl.DEVICE.
 
-def load_weights(model: nn.Module, filepath: str):
-    """Load state_dict saved on any device into model placed on bl.DEVICE."""
+    Args:
+        model: Network to load weights into.
+        filepath: Location of saved state_dict, as str or pathlib.Path.
+    """
     model.load_state_dict(
-        torch.load(filepath, map_location=bl.DEVICE, weights_only=True)
+        torch.load(Path(filepath), map_location=bl.DEVICE, weights_only=True)
     )
 
 
@@ -98,7 +102,7 @@ class BL_DQN_Conv_Network_Heavy(nn.Module):
     """Build heavier version of BL_DQN_CONV_Network.
 
     This network has high possibility of overfitting.
-    Parameter count: 1 846 080 Activation: ReLU
+    Parameter count: 1 846 080. Activation: ReLU
     """
 
     IN_CON_CHANNELS = 1
@@ -174,40 +178,6 @@ class BL_DQN_Action_Network_v1(nn.Module):
 
         final_input = torch.cat((board_out, blocks_out, streak_out), dim=1)
         return self.afterwards_net(final_input)
-
-    def validate_model(self, num_games: int = 1):
-        """Validate perfomance of NN.
-
-        Args:
-            num_games: Number of games to validate on.
-        """
-        scores = []
-        for _ in range(num_games):
-            st_nw = bl.State()
-            curr_mask = st_nw.calculate_mask()
-            game_over = False
-            score = 0
-            while not game_over:
-                board, blocks, streak = st_nw.in_board(), st_nw.in_blocks(), st_nw.in_streak()  # fmt: skip
-
-                nn_board = bl.to_tensor(board).unsqueeze(0)
-                nn_blocks = bl.to_tensor(blocks, torch.long).unsqueeze(0)
-                nn_streak = bl.to_tensor(streak).view(1, 1)
-
-                with torch.no_grad():
-                    y_hat_nn = self.forward(nn_board, nn_blocks, nn_streak).squeeze(0)
-                    y_hat_nn[~bl.to_tensor(curr_mask, torch.bool)] = -1e9
-
-                action = int(torch.argmax(y_hat_nn))
-                piece, x, y = bl.State.decode_action(action)
-
-                rwrd, is_terminal, new_mask = st_nw.transition(piece, x, y)
-                game_over = is_terminal
-                curr_mask = new_mask
-                score += rwrd
-            scores.append(score - bl.NEURAL_PENALTY)
-
-        return f"Points in val games: {scores}, mean: {np.mean(scores):.2f}, std: {np.std(scores):.2f}"
 
 
 class BL_DQN_State_Network_Base(nn.Module):
@@ -381,11 +351,14 @@ class ActionsStorage:
         )
         # fmt: on
 
-    def add_records(self, boards_s: np.ndarray, blocks_s: np.ndarray, streaks_s: np.ndarray,
-                          boards_f: np.ndarray, blocks_f: np.ndarray, streaks_f: np.ndarray,
-                          actions: np.ndarray, rewards: np.ndarray, terminals: np.ndarray, 
-                          masks_f: np.ndarray):  # fmt: skip
+    def add_records(self, boards_s: bl.TensorLike, blocks_s: bl.TensorLike, streaks_s: bl.TensorLike,
+                          boards_f: bl.TensorLike, blocks_f: bl.TensorLike, streaks_f: bl.TensorLike,
+                          actions: bl.TensorLike, rewards: bl.TensorLike, terminals: bl.TensorLike,
+                          masks_f: bl.TensorLike):  # fmt: skip
         """Add detailed records of singular moves to storage.
+
+        Accepts torch.Tensors (preferably already on bl.DEVICE) or np.arrays.
+        Boards may be passed flat (n, BOARD_FLAT) or as (n, 1, BOARD_LEN, BOARD_LEN).
 
         Args:
             board_s, blocks_s, streaks_s: Pre-action state.
@@ -396,6 +369,8 @@ class ActionsStorage:
         """
 
         n = len(boards_s)  # Amount of records to add.
+        if n == 0:
+            return
         # fmt: off
         incoming_data = (
             boards_s, blocks_s, streaks_s,
@@ -403,17 +378,12 @@ class ActionsStorage:
             actions, rewards, terminals, masks_f
         )
         # fmt: on
-
-        if self.offset + n <= self.C:
-            for buf, data in zip(self.buffers, incoming_data):
-                buf[self.offset : self.offset + n] = bl.to_tensor(data, buf.dtype)
-        else:
-            space_left = self.C - self.offset
-            remainder = n - space_left
-
-            for buf, data in zip(self.buffers, incoming_data):
-                buf[self.offset : self.C] = bl.to_tensor(data[:space_left], buf.dtype)
-                buf[0:remainder] = bl.to_tensor(data[space_left:], buf.dtype)
+        # Only the newest C records would survive anyway.
+        skip = max(0, n - self.C)
+        idx = (self.offset + skip + torch.arange(n - skip, device=bl.DEVICE)) % self.C
+        for buf, data in zip(self.buffers, incoming_data):
+            data = bl.to_tensor(data, buf.dtype)[skip:]
+            buf[idx] = data.reshape(-1, *buf.shape[1:])
 
         self.offset = (self.offset + n) % self.C
         self.size = min(self.size + n, self.C)
@@ -425,8 +395,9 @@ class ActionsStorage:
             num_samples: Size of the sample.
 
         Returns:
-            np.arrays representing informations of singular moves, in a same
-            order and functionality as described for add_records() method.
+            torch.Tensors on bl.DEVICE representing informations of singular
+            moves, in a same order and functionality as described for
+            add_records() method.
         """
         idx = torch.randint(0, self.size, (num_samples,), device=bl.DEVICE)
         return tuple(buf[idx] for buf in self.buffers)

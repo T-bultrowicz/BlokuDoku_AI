@@ -1,6 +1,5 @@
-import os
 import random as rand
-
+import os
 import numpy as np
 import torch
 
@@ -81,7 +80,6 @@ NN_OUTPUT_FLAT = BLOCKS_TO_PICK * BOARD_FLAT
 # Parameter for NN training, used to punish terminal states.
 NEURAL_PENALTY = -50
 
-
 # Handling different devices logic.
 def _pick_device() -> torch.device:
     """Pick device for NNs: CUDA, then Apple MPS, then CPU.
@@ -102,6 +100,9 @@ DEVICE = _pick_device()
 if DEVICE.type == "cuda":
     # Input shapes are fixed, let cuDNN pick fastest kernels.
     torch.backends.cudnn.benchmark = True
+# Dtype used for matrix multiplications on boards/placements tables.
+# Half precision on CUDA for tensor-core speed, full precision elsewhere.
+MM_DTYPE = torch.float16 if DEVICE.type == "cuda" else torch.float32
 
 # Anything to_tensor() accepts.
 TensorLike = np.ndarray | torch.Tensor
@@ -204,14 +205,12 @@ class VectorizedStates:
     """
 
     MAX_BOARDS = 10_000
-    MM_DTYPE = torch.float16 if DEVICE.type == "cuda" else torch.float32
     CHUNK = 8192
 
     # SHAPES: (48, 81, 81), (48, 81), (27, 81). (47 + EMPTY_BLOCK)
     PLACEMENTS, IN_BOUNDS, LINES = _calc_constant_tables()
     PLACEMENTS_FLAT = PLACEMENTS.view(-1, BOARD_FLAT)
-    PLACEMENTS_MM = PLACEMENTS_FLAT.to(MM_DTYPE)
-    PLACEMENTS_T = PLACEMENTS_MM.T.contiguous()
+    PLACEMENTS_T = PLACEMENTS_FLAT.to(MM_DTYPE).T.contiguous() # (81, 48 * 81)
     LINES_T = LINES.to(MM_DTYPE).T.contiguous()  # (81, 27)
     OFFSETS = torch.arange(BOARD_FLAT, device=DEVICE)
 
@@ -256,27 +255,33 @@ class VectorizedStates:
         """
         indices = self._move_indices()
         # (N, 81) @ (81, (BLOCKS_SIZE + 1) * 81) -> overlap for every block.
-        overlap = self.boards.to(self.MM_DTYPE) @ self.PLACEMENTS_T
+        overlap = self.boards.to(MM_DTYPE) @ self.PLACEMENTS_T
         overlap = torch.gather(overlap, dim=1, index=indices)
         # Pick only columns of available blocks, that are in bounds.
         return (overlap == 0) & self.IN_BOUNDS.view(-1)[indices]
 
-    def legal_moves2(self):
-        """Same as legal_moves, but instead of one big matrix multiply,
-        gathers placement masks of available blocks only and performs
-        N small multiplies (1, 81) @ (81, BLOCKS_TO_PICK * 81) via bmm.
+    def _available_after_moves(self):
+        """Calculate blocks available after each move: used slot emptied, empty
+        slots moved last, refilled once all used.
+
+        Returns:
+            L: (N, NN_OUTPUT_FLAT, BLOCKS_TO_PICK) uint8 of blocks.
         """
-        indices = self._move_indices()
-        # (N, 243, 81) -> transposed view (N, 81, 243), bmm handles strides.
-        masks = self.PLACEMENTS_MM[indices].transpose(1, 2)
-        overlap = torch.bmm(self.boards.to(self.MM_DTYPE).unsqueeze(1), masks)
-        return (overlap.squeeze(1) == 0) & self.IN_BOUNDS.view(-1)[indices]
+        L = self.available[:, None, :].repeat(1, NN_OUTPUT_FLAT, 1)
+        L = L.view(self.N, BLOCKS_TO_PICK, BOARD_FLAT, BLOCKS_TO_PICK)
+        for k in range(BLOCKS_TO_PICK):
+            L[:, k, :, k] = EMPTY_SLOT
+        L = L.view(self.N, NN_OUTPUT_FLAT, BLOCKS_TO_PICK)
+        empty = (L == EMPTY_SLOT).all(dim=-1, keepdim=True)
+        L = torch.where(empty, self._gen_available()[:, None, :], L)
+        order = (L == EMPTY_SLOT).to(torch.uint8).argsort(dim=-1, stable=True)
+        return L.gather(-1, order)
 
     def _simulate_transitions(
-        self, mask: torch.Tensor, boards: torch.Tensor, fills: torch.Tensor
+        self, boards: torch.Tensor, placed: torch.Tensor, old_streaks: torch.Tensor
     ):
-        """ Calculate all logic of making correct moves from mask. Obtain rewards, 
-        terminals and new boards - only for legal moves.
+        """Calculate all logic of making legal moves: line clearings, rewards
+        and streaks for M arbitrary afterstates.
 
         Args:
             boards: (M, BOARD_FLAT) bools, boards right after placing a block.
@@ -287,21 +292,17 @@ class VectorizedStates:
             Tuple (rewards, boards, streaks) of shapes (M,), (M, BOARD_FLAT), (M,):
             reward without NEURAL_PENALTY, board after clearings, new streak flag.
         """
-        B = boards[mask]
-        F = fills[mask]
-        S_old = self.streaks.view(-1, 1).expand(mask.shape)[mask]
-
-        counts = B.to(self.MM_DTYPE) @ self.LINES_T  # (M, 81) @ (81, 27) = (M, 27)
-        hits = counts == BOARD_LEN  #  Only columns were sum = BOARD_LEN
-        cleared = (hits.to(self.MM_DTYPE) @ self.LINES.to(self.MM_DTYPE)) > 0
+        counts = boards.to(MM_DTYPE) @ self.LINES_T  # (M, 27)
+        hits = counts == BOARD_LEN
+        cleared = (hits.to(MM_DTYPE) @ self.LINES.to(MM_DTYPE)) > 0
         streaks = hits.any(dim=-1)
-        B = B & ~cleared
+        boards = boards & ~cleared
 
-        rewards = (F & ~cleared).sum(dim=-1)
+        rewards = (placed & ~cleared).sum(dim=-1)
         rewards += hits.sum(dim=-1) * self.CLEAR_RWRD
-        rewards += (streaks & S_old) * self.STREAK_RWRD
-        rewards += ~B.any(dim=-1) * self.TOTAL_CLEAR_RWRD
-        return rewards, B, streaks
+        rewards += (streaks & old_streaks) * self.STREAK_RWRD
+        rewards += ~boards.any(dim=-1) * self.TOTAL_CLEAR_RWRD
+        return rewards, boards, streaks
 
     def _has_legal_move(self, boards: torch.Tensor, blocks: torch.Tensor):
         """Whether any legal move exists, for M arbitrary states.
@@ -314,78 +315,101 @@ class VectorizedStates:
             (M,) bools.
         """
         out = torch.empty(len(boards), dtype=torch.bool, device=DEVICE)
-        # Full overlap table is (chunk, 49 * 81) - hence chunking.
         for s in range(0, len(boards), self.CHUNK):
-            overlap = boards[s : s + self.CHUNK].to(self.MM_DTYPE) @ self.PLACEMENTS_T
+            overlap = boards[s : s + self.CHUNK].to(MM_DTYPE) @ self.PLACEMENTS_T
             overlap = overlap.view(-1, BLOCKS_SIZE + 1, BOARD_FLAT)
-            fits = ((overlap == 0) & self.IN_BOUNDS).any(dim=-1)  # (chunk, 49)
+            fits = ((overlap == 0) & self.IN_BOUNDS).any(dim=-1)  # (chunk, 48)
             out[s : s + self.CHUNK] = fits.gather(
                 1, blocks[s : s + self.CHUNK].long()
             ).any(dim=-1)
         return out
 
     def states_prim(self):
-        """Calculate all variants of moves from states to their afterstates.
+        """Calculate afterstates of every legal move in each of N games.
 
-        Keeps current state unchanged, every element of returned tuple is
-        torch.Tensor constructed on proper device. Entries of illegal actions
-        are meaningless (zeros / board with block placed on top).
+        Rows are stacked game-major, M = MC.sum().
 
         Returns:
-            Tuple (A, R, T, B, L, S), where:
-            A[i]: - Is action encoded as i legal. (N, 243)
-            R[i]: - reward from picking action i. (N, 243)
-            T[i]: - is action i terminal. (N, 243)
-            B[i]: - state of board after taking action i. (N, 243, 81)
-            L[i]: - blocks available after taking action i. (N, 243, 3)
-            S[i]: - is streak on after action i. (N, 243)
+            Tuple (A, R, T, B, L, S, MC)
+            A: (M,) long, flat action index.
+            R: (M,) int16, reward of A[i]
+            T: (M,) bools, whether A[i] afterstate is terminal.
+            B: (M, 1, BOARD_LEN, BOARD_LEN) bools, board after the move.
+            L: (M, BLOCKS_TO_PICK) uint8, blocks available after the move.
+            S: (M, 1) bools, streak flag after the move.
+            MC: (N,) long, legal moves count per game.
         """
-        N = self.N
-        A = self.legal_moves()  # (N, 243)
-        placed = self.PLACEMENTS_FLAT[self._move_indices()]  # (N, 243, 81)
-        B = self.boards[:, None, :] | placed
+        mask = self.legal_moves()
+        A = torch.arange(NN_OUTPUT_FLAT, dtype=torch.long, device=DEVICE) \
+                 .expand(self.N, -1)
+        placed = self.PLACEMENTS_FLAT[self._move_indices()] # (N, 243, 81)
+        B = self.boards[:, torch.newaxis] | placed
+        L = self._available_after_moves()  # (N, NN_OUTPUT_FLAT, BLOCKS_TO_PICK)
+        S = self.streaks.expand(-1, NN_OUTPUT_FLAT)  # (N, NN_OUTPUT_FLAT)
 
-        # Slot k is used up by actions [k * 81, (k + 1) * 81).
-        L = self.available[:, None, :].repeat(1, NN_OUTPUT_FLAT, 1)
-        L = L.view(N, BLOCKS_TO_PICK, BOARD_FLAT, BLOCKS_TO_PICK)
-        for k in range(BLOCKS_TO_PICK):
-            L[:, k, :, k] = EMPTY_SLOT
-        L = L.view(N, NN_OUTPUT_FLAT, BLOCKS_TO_PICK)
+        # Keep legal moves only: (N, NN_OUTPUT_FLAT, ...) -> (M, ...).
+        A, placed, B, L, S = A[mask], placed[mask], B[mask], L[mask], S[mask]
 
-        empty = (L == EMPTY_SLOT).all(dim=-1, keepdim=True)
-        fresh = self._gen_available()[:, None, :]  # (N, 1, 3)
-        L = torch.where(empty, fresh, L)
+        R, B, S = self._simulate_transitions(B, placed, S)
+        T = ~self._has_legal_move(B, L)
+        R += T * NEURAL_PENALTY
 
-        # Clearings, rewards and terminals only for legal moves.
-        rewards, boards, streaks = self._simulate_transitions(A, B, placed)
-        terminals = ~self._has_legal_move(boards, L[A])
-        rewards += terminals * NEURAL_PENALTY
-
-        R = torch.zeros((N, NN_OUTPUT_FLAT), dtype=torch.int16, device=DEVICE)
-        T = torch.zeros((N, NN_OUTPUT_FLAT), dtype=torch.bool, device=DEVICE)
-        S = torch.zeros((N, NN_OUTPUT_FLAT), dtype=torch.bool, device=DEVICE)
-        B[A] = boards
-        R[A] = rewards.to(torch.int16)
-        T[A] = terminals
-        S[A] = streaks
-        return A, R, T, B, L, S
+        return (
+            A,
+            R.to(torch.int16),
+            T,
+            B.view(-1, 1, BOARD_LEN, BOARD_LEN),
+            L,
+            S.view(-1, 1),
+            mask.sum(dim=-1),
+        )
 
     def mass_transition(
         self, boards: torch.Tensor, available: torch.Tensor, streaks: torch.Tensor
     ):
-        self.boards = boards
+        """Replace all N states at once.
+
+        Args:
+            boards: (N, BOARD_FLAT) or (N, 1, BOARD_LEN, BOARD_LEN) bools.
+            available: (N, BLOCKS_TO_PICK) uint8.
+            streaks: (N,) or (N, 1) bools.
+        """
+        self.boards = boards.reshape(self.N, BOARD_FLAT)
         self.available = available
-        self.streaks = streaks
+        self.streaks = streaks.reshape(self.N, 1)
+
+    def drop(self, mask: torch.Tensor):
+        """Drop games that have mask set to True from the batch.
+
+        Args:
+            mask: (N,) Games to drop.
+        """
+        neg = ~mask
+        self.boards = self.boards[neg]
+        self.available = self.available[neg]
+        self.streaks = self.streaks[neg]
+        self.N = len(self.boards)
 
     def reset(self, mask: torch.Tensor):
+        """Resets games that mask sets to true.
+        
+        Args:
+            mask: Tensor of shape (N,) - must be equal self.N.
+        """
         self.boards[mask] = False
         self.available = torch.where(mask[:, torch.newaxis], self._gen_available(), self.available)
         self.streaks[mask] = False
 
-    def nn_input(self):
-        B = self.boards.reshape(self.N, 1, BOARD_LEN, BOARD_LEN)
-        S = self.streaks.reshape(self.N, 1)
-        return B, self.available, S
+    def legal_moves2(self):
+        """Same as legal_moves, but instead of one big matrix multiply,
+        gathers placement masks of available blocks only and performs
+        N small multiplies (1, 81) @ (81, BLOCKS_TO_PICK * 81) via bmm.
+        """
+        indices = self._move_indices()
+        # (N, 243, 81) -> transposed view (N, 81, 243), bmm handles strides.
+        masks = self.PLACEMENTS_FLAT.to(MM_DTYPE)[indices].transpose(1, 2)
+        overlap = torch.bmm(self.boards.to(MM_DTYPE).unsqueeze(1), masks)
+        return (overlap.squeeze(1) == 0) & self.IN_BOUNDS.view(-1)[indices]
 
 
 class State:
@@ -422,22 +446,22 @@ class State:
     def transition(self, piece: int, x: int, y: int):
         """In place move, returns [reward, terminal, mask of state']."""
         a = State.encode_action(piece, x, y)
-        A, R, T, B, L, S = self._vs.states_prim()
-        if not A[0, a]:
+        A, R, T, B, L, S, _ = self._vs.states_prim()
+        i = (A == a).nonzero().flatten()
+        if len(i) == 0:
             raise ValueError(f"Illegal action: piece={piece}, x={x}, y={y}")
-        self._vs.mass_transition(B[0, a : a + 1], L[0, a : a + 1], S[0, a : a + 1].view(1, 1))
-        return [int(R[0, a]), bool(T[0, a]), self.calculate_mask()]
+        self._vs.mass_transition(B[i], L[i], S[i])
+        return [int(R[i]), bool(T[i]), self.calculate_mask()]
 
     def all_1move_states(self, mask: np.ndarray | None = None):
         """Legal actions and their afterstates as numpy (A, R, T, B, L, S).
         mask is ignored, kept for the old signature."""
-        A, R, T, B, L, S = (t[0] for t in self._vs.states_prim())
-        actions = A.nonzero().flatten()
+        A, R, T, B, L, S, _ = self._vs.states_prim()
         return (
-            actions.cpu().numpy(),
-            R[actions].cpu().numpy(),
-            T[actions].cpu().numpy(),
-            B[actions].cpu().numpy().reshape(-1, 1, BOARD_LEN, BOARD_LEN),
-            L[actions].cpu().numpy().astype(np.int8),
-            S[actions].cpu().numpy().reshape(-1, 1),
+            A.cpu().numpy(),
+            R.cpu().numpy(),
+            T.cpu().numpy(),
+            B.cpu().numpy(),
+            L.cpu().numpy().astype(np.int8),
+            S.cpu().numpy(),
         )

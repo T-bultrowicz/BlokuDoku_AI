@@ -2,7 +2,6 @@ import blokudoku_lib as bl
 import network_lib as net
 import user_play as user_play
 
-import numpy as np
 import os
 import sys
 import time
@@ -10,6 +9,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import copy
+import profiling
+from contextlib import contextmanager
 from pathlib import Path
 
 # Weights and best scores live here, no matter the current working directory.
@@ -27,6 +28,7 @@ GAMES_TO_PLAY_TEST = 500
 GAMES_TO_PLAY_PROFILE = 3_000
 DISPLAY_ERR_FREQ = 1500
 GAMES_TO_DISPLAY_INFO = 250
+VAL_GAMES_CHUNK = 256  # Chunk size for val_net.
 VALIDATION_GAMES_PER_BATCH = 5
 VALIDATION_GAMES_PER_FIGHT = 25
 
@@ -47,8 +49,8 @@ GAMMA = 0.5
 
 def try_write_best_net(
     netw: nn.Module,
-    filepath_net: str,
-    filepath_score: str,
+    filepath_net: str | Path,
+    filepath_score: str | Path,
     val_games_num: int,
     netw_res: float = 0.0,
 ):
@@ -78,7 +80,7 @@ def try_write_best_net(
     """
     if not os.path.exists(filepath_net):
         torch.save(netw.state_dict(), filepath_net)
-        current_score, _ = val_state_net(netw, val_games_num)  # type: ignore
+        current_score, _ = val_net(netw, val_games_num)  # type: ignore
 
         with open(filepath_score, "w") as f:
             f.write(str(current_score))
@@ -103,7 +105,7 @@ def try_write_best_net(
 
     if not load_success:
         torch.save(netw.state_dict(), filepath_net)
-        current_score, _ = val_state_net(netw, val_games_num)  # type: ignore
+        current_score, _ = val_net(netw, val_games_num)  # type: ignore
 
         with open(filepath_score, "w") as f:
             f.write(str(current_score))
@@ -111,8 +113,8 @@ def try_write_best_net(
         return
 
     print(f"\nStarting game validation - two agent fight ...")
-    current_score, _ = val_state_net(netw, val_games_num)  # type: ignore
-    saved_score, _ = val_state_net(saved_net, val_games_num)  # type: ignore
+    current_score, _ = val_net(netw, val_games_num)  # type: ignore
+    saved_score, _ = val_net(saved_net, val_games_num)  # type: ignore
 
     # Kto wygrał?
     if current_score > saved_score:
@@ -127,13 +129,98 @@ def try_write_best_net(
         with open(filepath_score, "w") as f:
             f.write(str(saved_score))
 
+def _segment_argmax(vals: torch.Tensor, gid: torch.Tensor, n: int):
+    """Calculate argmax of vals separately inside every game.
 
-def val_state_net(netw: nn.Module, games_count: int = 100, more_info: bool = False):
-    """Function that validates netw performance on games_count games.
+    Args:
+        vals: (M,) values of stacked moves.
+        gid: (M,) long, game index of every move.
+        n: number of games, each must own at least one move.
+
+    Returns:
+        best: (n,) long, row of the first maximal value of every game.
+    """
+    # Get best values.
+    M = len(vals)
+    best_vals = torch.full((n,), -torch.inf, dtype=vals.dtype, device=vals.device)
+    best_vals.scatter_reduce_(0, gid, vals, reduce="amax")
+    # Revocer indices of best values.
+    rows = torch.arange(M, device=vals.device)
+    candidates = torch.where(vals == best_vals[gid], rows, M)
+    best = torch.full((n,), M, dtype=torch.long, device=vals.device)
+    return best.scatter_reduce(0, gid, candidates, reduce="amin")
+
+
+def _eps_greedy_rows(qs: torch.Tensor, lengths: torch.Tensor, eps: float):
+    """Choose one move per game: the best one, or with probability eps a random legal one.
+
+    Args:
+        qs: (M,) values of stacked legal moves, game-major.
+        lengths: (N,) long, legal moves count per game, each > 0.
+
+    Returns:
+        rows: (N,) long, chosen row for every game.
+    """
+    N, M = len(lengths), len(qs)
+    pos = torch.arange(N, device=bl.DEVICE)
+    best = _segment_argmax(qs, torch.repeat_interleave(pos, lengths, output_size=M), N)
+    if eps == 0:
+        return best
+    random = lengths.cumsum(0) - lengths + (torch.rand(N, device=bl.DEVICE) * lengths).long()
+    return torch.where(torch.rand(N, device=bl.DEVICE) < eps, random, best)
+
+
+def _move_values(netw: nn.Module, vs: bl.VectorizedStates, A, B, L, S, MC):
+    """Values netw assigns to stacked legal moves of vs: V(afterstate) for state
+    networks, Q(state, action) for action networks.
+
+    Args:
+        A, B, L, S, MC: as returned by vs.states_prim().
+
+    Returns:
+        (M,) floats, one per row of states_prim().
+    """
+    with torch.no_grad():
+        if isinstance(netw, net.BL_DQN_Action_Network_v1):
+            boards = vs.boards.view(-1, 1, bl.BOARD_LEN, bl.BOARD_LEN).float()
+            qs = netw(boards, vs.available.long(), vs.streaks.float())  # (N, 243)
+            pos = torch.arange(vs.N, device=bl.DEVICE)
+            return qs[torch.repeat_interleave(pos, MC, output_size=len(A)), A]
+        out = netw(B.float(), L.long(), S.float())
+    return (out[0] if isinstance(out, tuple) else out).view(-1)
+
+
+def _play_greedy_batch(netw: nn.Module, games: int):
+    """Play `games` games in parallel, greedily, until every one of them ends.
+
+    Returns:
+        (games,) int32 tensor of summed rewards, NEURAL_PENALTY included.
+    """
+    scores = torch.zeros(games, dtype=torch.int32, device=bl.DEVICE)
+    game_ids = torch.arange(games, device=bl.DEVICE)  # original index of live games
+    vs = bl.VectorizedStates(games)
+    while vs.N > 0:
+        A, R, T, B, L, S, MC = vs.states_prim()
+        best = _eps_greedy_rows(_move_values(netw, vs, A, B, L, S, MC), MC, 0.0)
+        scores[game_ids] += R[best]
+        vs.mass_transition(B[best], L[best], S[best])
+        vs.drop(T[best])
+        game_ids = game_ids[~T[best]]
+    return scores
+
+
+def val_net(
+    netw: nn.Module,
+    games_count: int = 100,
+    more_info: bool = False,
+    games_chunk: int = VAL_GAMES_CHUNK,
+):
+    """Validate netw performance on games_count games, played greedily in batches.
 
     Args:
         games_count: games to play
-        more_info: whether to return more
+        more_info: Whether to return max and min of achieved results.
+        games_chunk: Games played in parallel, bounds memory for big games_count.
 
     Returns:
         mean: mean of achieved results
@@ -141,44 +228,21 @@ def val_state_net(netw: nn.Module, games_count: int = 100, more_info: bool = Fal
         max (only if more_info=True): max of achieved results
         min (only if more_info=True): min of achieved results
     """
-    scores = []
+    was_training = netw.training
     netw.eval()
+    scores = torch.cat(
+        [
+            _play_greedy_batch(netw, min(games_chunk, games_count - s))
+            for s in range(0, games_count, games_chunk)
+        ]
+    )
+    netw.train(was_training)
 
-    for _ in range(games_count):
-        cur_state = bl.State()
-        mask = cur_state.calculate_mask()
-        game_over = False
-        score = 0
-        while not game_over:
-            # fmt: off
-            actions, rewards, _, boards, blocks, streaks = cur_state.all_1move_states(mask)
-            # fmt: on
-
-            nn_board = bl.to_tensor(boards)
-            nn_blocks = bl.to_tensor(blocks, torch.long)
-            nn_streak = bl.to_tensor(streaks).view(-1, 1)
-
-            with torch.no_grad():
-                out = netw(nn_board, nn_blocks, nn_streak)
-                v_values = (
-                    out[0].squeeze(-1) if isinstance(out, tuple) else out.squeeze(-1)
-                )
-                y_hat_nn = v_values + bl.to_tensor(rewards)
-
-            best_idx = int(torch.argmax(y_hat_nn))
-            best_action_encoded = actions[best_idx]
-
-            piece, x, y = bl.State.decode_action(best_action_encoded)
-            rwrd, game_over, mask = cur_state.transition(piece, x, y)
-            score += int(rwrd)
-
-        scores.append(score - bl.NEURAL_PENALTY)
-    netw.train()
+    scores = (scores - bl.NEURAL_PENALTY).float()
+    mean, std = scores.mean().item(), scores.std(correction=0).item()
     if more_info:
-        res = np.mean(scores), np.std(scores), np.max(scores), np.min(scores)
-    else:
-        res = np.mean(scores), np.std(scores)
-    return res
+        return mean, std, scores.max().item(), scores.min().item()
+    return mean, std
 
 
 def calculate_aux_targets(boards_tensor: torch.Tensor):
@@ -224,11 +288,6 @@ def calculate_aux_targets(boards_tensor: torch.Tensor):
     return torch.stack([f1, f2, f3, f4, f5], dim=1)
 
 
-def _randomise(mask: np.ndarray):
-    valid_actions = np.flatnonzero(mask)
-    return bl.rng_fact_instance.choice(valid_actions)
-
-
 class ActionNetworkTrainer:
     """Class capable of triaing and testing BL_DQN_Action_Network_v1().
 
@@ -238,83 +297,53 @@ class ActionNetworkTrainer:
 
     SAVE_PATH = NETWORKS_DIR / "action_network_v1.pt"
 
-    @staticmethod
-    def showcase_network():
+    def showcase_network(self):
         raise RuntimeError(
             "Showcase network is not yet implemented for action network! \
 (Sorry for the inconvenience)"
         )
 
-    @staticmethod
-    def test_network(games_to_play: int = GAMES_TO_PLAY_TEST):
+    def test_network(self, games_to_play: int = GAMES_TO_PLAY_TEST):
         """Tests netowork on games_to_play games."""
         main_net = net.BL_DQN_Action_Network_v1().to(bl.DEVICE)
-
         try:
-            net.load_weights(main_net, ActionNetworkTrainer.SAVE_PATH)
+            net.load_weights(main_net, self.SAVE_PATH)
         except Exception as e:
             print(
-                f"Error - didn't managed to find network params in filepath{ActionNetworkTrainer.SAVE_PATH}\n"
+                f"Error - didn't managed to find network params in filepath{self.SAVE_PATH}\n"
             )
             return
 
-        print(main_net.validate_model(games_to_play))
+        score, score_std = val_net(main_net, games_to_play)  # type: ignore
+        print(f"Tested model performance - mean score: {score:.2f}, std: {score_std:.2f}")
 
-    @staticmethod
     def _play_parallel_games(
-        states: list,
+        self,
+        states: bl.VectorizedStates,
         main_net: net.BL_DQN_Action_Network_v1,
         storage: net.ActionsStorage,
         eps: float,
-        games_count: int,
     ):
-        masks = np.array([st.calculate_mask() for st in states])
-        boards = [st.in_board() for st in states]
-        blocks = [st.in_blocks() for st in states]
-        streaks = [st.in_streak() for st in states]
+        """Make one move in every game, eps-greedily according to main_net.
+        Moves are saved into storage, finished games start anew.
 
-        nn_boards = bl.to_tensor(np.array(boards))
-        nn_blocks = bl.to_tensor(np.array(blocks), torch.long)
-        nn_streaks = bl.to_tensor(np.array(streaks))
+        Returns:
+            terminals: (N,) bools, whether game ended with its move.
+        """
+        A, R, T, B, L, S, MC = states.states_prim()
+        boards_s, blocks_s, streaks_s = states.boards, states.available, states.streaks
+        rows = _eps_greedy_rows(_move_values(main_net, states, A, B, L, S, MC), MC, eps)
 
-        with torch.no_grad():
-            y_hat_nn = main_net(nn_boards, nn_blocks, nn_streaks)
-            y_hat_nn[~bl.to_tensor(masks, torch.bool)] = -1e9
-            best_actions = torch.argmax(y_hat_nn, dim=1).tolist()
+        states.mass_transition(B[rows], L[rows], S[rows])
+        # fmt: off
+        storage.add_records(boards_s, blocks_s, streaks_s, B[rows], L[rows], S[rows],
+                            A[rows], R[rows], T[rows], states.legal_moves())
+        # fmt: on
+        states.reset(T[rows])
+        return T[rows]
 
-        decisions = [bl.rng_fact_instance.explore_now(eps) for _ in range(games_count)]
-        actions = [
-            (_randomise(masks[i]) if decisions[i] else best_actions[i])
-            for i in range(games_count)
-        ]
-        decoded_actions = [
-            bl.State.decode_action(actions[i]) for i in range(games_count)
-        ]
-
-        rewards = np.empty(games_count, dtype=np.int16)
-        terminals = np.empty(games_count, dtype=bool)
-        new_masks = np.empty((games_count, bl.NN_OUTPUT_FLAT), dtype=bool)
-        for i in range(games_count):
-            rewards[i], terminals[i], new_masks[i] = states[i].transition(
-                *decoded_actions[i]
-            )
-
-        storage.add_records(
-            np.array(boards),
-            np.array(blocks),
-            np.array(streaks),
-            np.array([st.in_board() for st in states]),
-            np.array([st.in_blocks() for st in states]),
-            np.array([st.in_streak() for st in states]),
-            np.array(actions),
-            rewards,
-            terminals,
-            new_masks,
-        )
-        return terminals
-
-    @staticmethod
     def _perform_gradient_descent(
+        self,
         main_net: net.BL_DQN_Action_Network_v1,
         target_net: net.BL_DQN_Action_Network_v1,
         storage: net.ActionsStorage,
@@ -350,44 +379,31 @@ class ActionNetworkTrainer:
         losses.backward()
         optimizer.step()
 
-    @staticmethod
-    def _exchange_networks(
-        loops: int,
-        main_net: net.BL_DQN_Action_Network_v1,
-        target_net: net.BL_DQN_Action_Network_v1,
-    ):
-        if loops % EXCHANGE_NETS_FREQ == 0:
-            target_net.load_state_dict(main_net.state_dict())
-
-    @staticmethod
     def _display_info(
+        self,
         games_played: int,
         games_played_mod: int,
         batch_start_time: float,
         eps: float,
         main_net: net.BL_DQN_Action_Network_v1,
     ):
-
         if games_played_mod < GAMES_TO_DISPLAY_INFO:
             return games_played_mod, batch_start_time
 
         elapsed = time.perf_counter() - batch_start_time
         games_per_second = GAMES_TO_DISPLAY_INFO / elapsed if elapsed else float("inf")
-
         print(
             f"Games played: {games_played}, Games per second: "
             + f"{games_per_second:.2f}, batch time: {elapsed:.2f}s, eps: {eps:.4f}"
         )
-
         print(f"Validating model performance...")
-        print(main_net.validate_model(VALIDATION_GAMES_PER_BATCH))
-        print("\n")
+        score, score_std = val_net(main_net, VALIDATION_GAMES_PER_BATCH)  # type: ignore
+        print(f"Points in val games - mean: {score:.2f}, std: {score_std:.2f}\n")
 
         return games_played_mod % GAMES_TO_DISPLAY_INFO, time.perf_counter()
 
-    @staticmethod
     def train_action_network(
-        games_to_play: int = GAMES_TO_PLAY_TRAIN, games_count: int = GAMES_IN_PARALLEL
+        self, games_to_play: int = GAMES_TO_PLAY_TRAIN, games_count: int = GAMES_IN_PARALLEL
     ):
         """Trains network for games_to_play games, games_count of them being played in parallel.
 
@@ -404,33 +420,29 @@ class ActionNetworkTrainer:
         batch_start_time = time.perf_counter()
         eps = EPS_MAX
 
-        states = [bl.State() for _ in range(games_count)]
+        states = bl.VectorizedStates(games_count)
         games_played = 0
         games_played_mod = 0
         loops = 0
         while games_played < games_to_play:
-            terminals = ActionNetworkTrainer._play_parallel_games(
-                states, main_net, storage, eps, games_count
-            )
-            ActionNetworkTrainer._perform_gradient_descent(
-                main_net, target_net, storage, optimizer
-            )
+            terminals = self._play_parallel_games(states, main_net, storage, eps)
+            self._perform_gradient_descent(main_net, target_net, storage, optimizer)
 
             loops += 1
             eps = max(EPS_MIN, eps * (DECAY_RATE**games_count))
-            games_played += np.sum(terminals)
-            games_played_mod += np.sum(terminals)
-            for i in range(games_count):
-                if terminals[i]:
-                    states[i] = bl.State()
+            term_sum = int(terminals.sum())
+            games_played += term_sum
+            games_played_mod += term_sum
 
-            ActionNetworkTrainer._exchange_networks(loops, main_net, target_net)
+            # EXCHANGE NETWORKS
+            if loops % EXCHANGE_NETS_FREQ == 0:
+                target_net.load_state_dict(main_net.state_dict())
 
-            games_played_mod, batch_start_time = ActionNetworkTrainer._display_info(
+            games_played_mod, batch_start_time = self._display_info(
                 games_played, games_played_mod, batch_start_time, eps, main_net
             )
 
-        torch.save(main_net.state_dict(), ActionNetworkTrainer.SAVE_PATH)
+        torch.save(main_net.state_dict(), self.SAVE_PATH)
 
 
 class StateNetworkTrainer:
@@ -438,6 +450,7 @@ class StateNetworkTrainer:
 
     SAVE_PATH_NET = NETWORKS_DIR / "state_network_v1.pt"
     SAVE_PATH_SCORE = NETWORKS_DIR / "best_score.txt"
+    SHOWCASE_DELAY = 2  # Seconds between moves displayed by showcase_network.
 
     def showcase_network(self):
         """Interactive display in terminal (stdout), of how network saved under
@@ -458,22 +471,16 @@ class StateNetworkTrainer:
         state = bl.State()
         while not game_over:
             user_play.output_to_player(state, score, game_over)
-            # fmt: off
-            (a_actions, a_rewards, a_terminals, a_boards,
-             a_blocks, a_streaks, lengths) = self._gather_data([state], [state.calculate_mask()])
-            # fmt: on
+            _, R, T, B, L, S, MC = self._gather_data(state._vs)
 
-            q_per_game = self._forward_data(
-                a_rewards, a_terminals, a_boards, a_blocks, a_streaks, main_net
-            )
-            chosen_actions = self._agent_decide(q_per_game, a_actions, 0.0, lengths)
-            rwrd, game_over, _ = state.transition(
-                *bl.State.decode_action(a_actions[0][chosen_actions[0]])
-            )
-            score += rwrd
-            time.sleep(2)
+            q_per_move = self._forward_data(R, T, B, L, S, main_net)
+            row = self._agent_decide(q_per_move, MC, 0.0)
+            state._vs.mass_transition(B[row], L[row], S[row])
+            score += int(R[row])
+            game_over = bool(T[row])
+            time.sleep(self.SHOWCASE_DELAY)
 
-        user_play.output_to_player(state, score, game_over)
+        user_play.output_to_player(state, score - bl.NEURAL_PENALTY, game_over)
 
     def test_network(self, games_to_play: int = GAMES_TO_PLAY_TEST):
         """Validate network on the set of games_to_play games. Print result to stdout."""
@@ -486,7 +493,7 @@ class StateNetworkTrainer:
             )
             return
 
-        score, score_std, max, min = val_state_net(main_net, games_to_play, True)  # type: ignore
+        score, score_std, max, min = val_net(main_net, games_to_play, True)  # type: ignore
         print(
             f"Tested model performance - mean score: {score:.2f}, std: {score_std:.2f}, \
 max:{max:.4f}, min:{min:.4f}"
@@ -502,99 +509,68 @@ max:{max:.4f}, min:{min:.4f}"
     def _get_optimizer(self, net: nn.Module, lr: float, weight_decay: float = 1e-4):
         return torch.optim.Adam(net.parameters(), lr=lr)
 
-    def _gather_data(self, states: list, masks: list):
-        # fmt: off
-        (all_actions, all_rewards, all_terminals,
-         all_boards, all_blocks, all_streaks) = [], [], [], [], [], []
-        # fmt: on
-        lengths = []
+    def _gather_data(self, states: bl.VectorizedStates):
+        """Calculate all legal moves of every game and their afterstates.
 
-        for i in range(len(masks)):
-            # fmt: off
-            actions, rewards, terminals, \
-                boards, blocks, streaks = states[i].all_1move_states(masks[i])
-            # fmt: on
-            all_actions.append(actions)
-            all_rewards.append(rewards)
-            all_terminals.append(terminals)
-            all_boards.append(boards)
-            all_blocks.append(blocks)
-            all_streaks.append(streaks)
-            lengths.append(len(actions))
-        # fmt: off
-        return (all_actions, all_rewards, all_terminals,
-                all_boards, all_blocks, all_streaks, lengths)
-        # fmt: on
+        Returns:
+            Tuple (A, R, T, B, L, S, MC), as described in VectorizedStates.states_prim().
+        """
+        return states.states_prim()
 
     def _forward_data(
         self,
-        rewards: list,
-        terminals: list,
-        boards: list,
-        blocks: list,
-        streaks: list,
+        rewards: torch.Tensor,
+        terminals: torch.Tensor,
+        boards: torch.Tensor,
+        blocks: torch.Tensor,
+        streaks: torch.Tensor,
         nn_net: nn.Module,
     ):
-        mega_rewards = bl.to_tensor(np.concatenate(rewards))
-        mega_terminals = bl.to_tensor(np.concatenate(terminals))
-        mega_nn_boards = bl.to_tensor(np.concatenate(boards))
-        mega_nn_blocks = bl.to_tensor(np.concatenate(blocks), torch.long)
-        mega_nn_streaks = bl.to_tensor(np.concatenate(streaks))
+        """Calculate Q values of moves: reward + discounted value nn_net predicts
+        for their afterstates (terminal afterstates are worth 0).
 
+        Returns:
+            q_values: (M,) floats, one per passed afterstate.
+        """
         with torch.no_grad():
-            out = nn_net(mega_nn_boards, mega_nn_blocks, mega_nn_streaks)
+            out = nn_net(boards.float(), blocks.long(), streaks.float())
             v_values = out[0].squeeze(1) if isinstance(out, tuple) else out.squeeze(1)
 
-        q_values = mega_rewards + (1 - mega_terminals) * DISCOUNT * v_values
+        q_values = rewards + ~terminals * DISCOUNT * v_values
         return q_values
 
-    def _agent_decide(self, qs: torch.Tensor, act: list, eps: float, lengths: list):
-        n = len(lengths)
-        choices = np.empty(n, dtype=np.int16)
-        explorations = [bl.rng_fact_instance.explore_now(eps) for _ in range(n)]
-        per_game = np.split(qs.cpu().numpy(), np.cumsum(lengths)[:-1])
+    def _agent_decide(self, qs: torch.Tensor, lengths: torch.Tensor, eps: float):
+        """Choose move in every game, best one or with probability eps random legal one.
 
-        for i in range(n):
-            if explorations[i]:
-                choices[i] = bl.rng_fact_instance.choice(range(len(act[i])))
-            else:
-                choices[i] = int(np.argmax(per_game[i]))
-        return choices
+        Returns:
+            rows: (N,) long, row of chosen move for every game.
+        """
+        return _eps_greedy_rows(qs, lengths, eps)
 
     def _env_update(
         self,
-        states: list,
-        masks: list,
-        chosen_actions: np.ndarray,
+        states: bl.VectorizedStates,
         storage,
-        all_actions: list,
+        rewards: torch.Tensor,
+        terminals: torch.Tensor,
+        boards: torch.Tensor,
+        blocks: torch.Tensor,
+        streaks: torch.Tensor,
     ):
-        n = chosen_actions.shape[0]
-        boards_s = np.array([st.in_board() for st in states])
-        blocks_s = np.array([st.in_blocks() for st in states])
-        streaks_s = np.array([st.in_streak() for st in states])
+        """Save chosen moves into storage and move games to their afterstates.
 
-        rewards = np.empty(n, dtype=np.int16)
-        terminals = np.empty(n, dtype=bool)
-        for i in range(n):
-            action_code = all_actions[i][chosen_actions[i]]
-            piece, x, y = bl.State.decode_action(action_code)
-            rewards[i], terminals[i], masks[i] = states[i].transition(piece, x, y)
+        Finished games are started anew. Every argument is one per game.
 
-        boards_f = np.array([st.in_board() for st in states])
-        blocks_f = np.array([st.in_blocks() for st in states])
-        streaks_f = np.array([st.in_streak() for st in states])
-
+        Returns:
+            term_sum: number of games that ended.
+        """
         # fmt: off
-        storage.add_records(boards_s, blocks_s, streaks_s,
-                            boards_f, blocks_f, streaks_f, rewards, terminals)
+        storage.add_records(states.boards, states.available, states.streaks,
+                            boards, blocks, streaks, rewards, terminals)
         # fmt: on
-
-        for i in range(n):
-            if terminals[i]:
-                states[i] = bl.State()
-                masks[i] = states[i].calculate_mask()
-        return states, masks, np.sum(terminals)
+        states.mass_transition(boards, blocks, streaks)
+        states.reset(terminals)
+        return int(terminals.sum())
 
     def _perform_gradient_descent(
         self,
@@ -608,7 +584,7 @@ max:{max:.4f}, min:{min:.4f}"
             return
 
         # fmt: off
-        (in_brd_st1, in_blk_st1, in_str_st1, 
+        (in_brd_st1, in_blk_st1, in_str_st1,
          in_brd_st2, in_blk_st2, in_str_st2,
          b_rewards, b_terminals) = storage.sample(BATCH_SIZE)
         # fmt: on
@@ -624,7 +600,7 @@ max:{max:.4f}, min:{min:.4f}"
             ).squeeze(1)
 
         target_fn = b_rewards + (1 - b_terminals) * DISCOUNT * y_hat_nn_target
-        losses = F.smooth_l1_loss(y_hat_nn_main, target_fn)
+        losses = F.mse_loss(y_hat_nn_main, target_fn)
 
         optimizer.zero_grad()
         losses.backward()
@@ -644,7 +620,7 @@ max:{max:.4f}, min:{min:.4f}"
         )
         print(f"Validating model performance...")
 
-        score, score_std = val_state_net(main_net, VALIDATION_GAMES_PER_BATCH)  # type: ignore
+        score, score_std = val_net(main_net, VALIDATION_GAMES_PER_BATCH)  # type: ignore
         print(f"Points in val games - mean: {score:.2f}, std: {score_std:.2f}")
         print()
 
@@ -677,25 +653,19 @@ max:{max:.4f}, min:{min:.4f}"
         batch_start_time = time.perf_counter()
         eps = EPS_MAX
 
-        states = [bl.State() for _ in range(games_count)]
-        masks = [st.calculate_mask() for st in states]
+        states = bl.VectorizedStates(games_count)
         games_played = 0
         games_played_mod = 0
         loops = 0
         while games_played < games_to_play:
-            # GATHER MOVES
-            # fmt: off
-            (a_actions, a_rewards, a_terminals, a_boards,
-             a_blocks, a_streaks, lengths) = self._gather_data(states, masks)
-            # fmt: on
+            # GATHER MOVES AND CHOOSE ONE PER GAME
+            _, R, T, B, L, S, MC = self._gather_data(states)
+            q_per_move = self._forward_data(R, T, B, L, S, main_net)
+            rows = self._agent_decide(q_per_move, MC, eps)
 
-            q_per_game = self._forward_data(
-                a_rewards, a_terminals, a_boards, a_blocks, a_streaks, main_net
-            )
-            chosen_actions = self._agent_decide(q_per_game, a_actions, eps, lengths)
-
-            states, masks, term_sum = self._env_update(
-                states, masks, chosen_actions, storage, a_actions
+            # PLAY THEM
+            term_sum = self._env_update(
+                states, storage, R[rows], T[rows], B[rows], L[rows], S[rows]
             )
 
             self._perform_gradient_descent(
@@ -785,7 +755,6 @@ class LightTrainer(StateNetworkTrainer):
         )
         # fmt: on
 
-
 class HeavyTrainer(StateNetworkTrainer):
     """Class for working with BL_DQN_State_Network_v1() heavy version model."""
 
@@ -816,80 +785,59 @@ class HeavyTrainer(StateNetworkTrainer):
             lr=lr,
         )
 
-
-from collections import defaultdict
-
-
 class TimedMixin:
     """Helper class to run diagnostics on what parts of code are the slowest.
 
-    To use mix inheritance from TimedMixin and one of Statetrainers. Run code
-    to be tested, collect results from class attribute - self.T dictionary.
+    Mix with one of the trainers, run code inside `with trainer.timed_run():`,
+    then call trainer.profiler.report(). Functions listed below get timed,
+    calls nested inside other timed ones show up as their subsections.
     """
+
+    # fmt: off
+    STAGES = {"_gather_data": "gather", "_forward_data": "forward",
+              "_agent_decide": "agent_decision", "_env_update": "env_update",
+              "_play_parallel_games": "play", "_perform_gradient_descent": "backprop",
+              "_display_info": "display_info"}
+    STORAGE = {"add_records": "storage.add_records", "sample": "storage.sample"}
+    PARTS = [
+        (bl.VectorizedStates, {name: name.strip("_") for name in (
+            "states_prim", "legal_moves", "_available_after_moves", "_simulate_transitions",
+            "_has_legal_move", "mass_transition", "reset", "drop")}),
+        (net.StateStorage, STORAGE), (net.SmartStateStorage, STORAGE), (net.ActionsStorage, STORAGE),
+        (sys.modules[__name__], {"_segment_argmax": "segment_argmax", "val_net": "val_net",
+                                 "try_write_best_net": "try_write_best_net"}),
+    ]
+    # fmt: on
 
     def __init__(self) -> None:
         super().__init__()
-        self.T = defaultdict(float)
+        self.profiler = profiling.Profiler()
 
-    class _timed:
-        def __init__(self, name: str, T: dict) -> None:
-            self.name = name
-            self.T = T
-
-        def __enter__(self):
-            if bl.DEVICE.type == "cuda":
-                torch.cuda.synchronize()
-            self.t = time.perf_counter()
-
-        def __exit__(self, *a):
-            if bl.DEVICE.type == "cuda":
-                torch.cuda.synchronize()
-            self.T[self.name] += time.perf_counter() - self.t
-
-    def _forward_data(self, *args, **kwargs):
-        with self._timed("forward", self.T):
-            return super()._forward_data(*args, **kwargs)  # type: ignore
-
-    def _gather_data(self, *args, **kwargs):
-        with self._timed("gather", self.T):
-            return super()._gather_data(*args, **kwargs)  # type: ignore
-
-    def _agent_decide(self, *args, **kwargs):
-        with self._timed("agent_decision", self.T):
-            return super()._agent_decide(*args, **kwargs)  # type: ignore
-
-    def _perform_gradient_descent(self, *args, **kwargs):
-        with self._timed("backprop", self.T):
-            return super()._perform_gradient_descent(*args, **kwargs)  # type: ignore
-
-    def _env_update(self, *args, **kwargs):
-        with self._timed("env_update", self.T):
-            return super()._env_update(*args, **kwargs)  # type: ignore
+    @contextmanager
+    def timed_run(self, name: str = "run"):
+        """Time everything inside the `with` block, listed functions become subsections."""
+        with self.profiler.instrument([(self, self.STAGES), *self.PARTS]), self.profiler.section(name):
+            yield self.profiler
 
 
+# fmt: off
 class T_StateNetworkTrainer(TimedMixin, StateNetworkTrainer):
     pass
-
-
 class T_AdvancedTrainer(TimedMixin, AdvancedTrainer):
     pass
-
-
 class T_LightTrainer(TimedMixin, LightTrainer):
     pass
-
-
 class T_HeavyTrainer(TimedMixin, HeavyTrainer):
     pass
+class T_ActionNetworkTrainer(TimedMixin, ActionNetworkTrainer):
+    pass
+# fmt: on
 
 
-class T_ActionNetworkTrainer:
-    def __init__(self) -> None:
-        raise RuntimeError(
-            "Showcase network is not yet implemented for action network! \
-(Sorry for the inconvenience)"
-        )
-
+def _train_fn(trainer):
+    if isinstance(trainer, ActionNetworkTrainer):
+        return trainer.train_action_network
+    return trainer.train_state_network
 
 def main(args):
     torch.manual_seed(bl.DEF_SEED)
@@ -966,10 +914,7 @@ def main(args):
     trainer = models[args[2]]
 
     if args[1] == "train":
-        if isinstance(trainer, ActionNetworkTrainer):
-            trainer.train_action_network(games_to_play)
-        else:
-            trainer.train_state_network(games_to_play)
+        _train_fn(trainer)(games_to_play)
     elif args[1] == "test":
         trainer.test_network(games_to_play)
     elif args[1] == "watch_ai_play":
@@ -985,27 +930,14 @@ def main(args):
         trainer = timed_models[args[2]]()
         print(f"Beginning diagnostics on {games_to_play} games of training!")
 
-        t_start = time.perf_counter()
-        trainer.train_state_network(games_to_play)
-        t_total = time.perf_counter() - t_start
-        t_rest = 0.0
-        for key, val in trainer.T.items():
-            t_rest += val
-            print(
-                f"Function {key} took ~{(val * 100 / t_total):.2f}"
-                + " percents of whole code execution!"
-            )
-
-        print(
-            f"Rest of code took: ~{((t_total - t_rest) * 100 / t_total):.2f}"
-            + " percents."
-        )
+        with trainer.timed_run("train"):
+            _train_fn(trainer)(games_to_play)
+        trainer.profiler.report()
 
 
 def cli():
     """Entry point of the `blokudoku` command (see [project.scripts])."""
     main(sys.argv)
-
 
 if __name__ == "__main__":
     cli()

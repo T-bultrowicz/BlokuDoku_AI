@@ -30,13 +30,15 @@ def transition(board: np.ndarray, blocks: np.ndarray, streak: bool, action: int)
     """Apply one move.
 
     Returns:
-        (reward without NEURAL_PENALTY, board, blocks with used slot set to
-        EMPTY_SLOT, streak). No redraw of blocks is performed.
+        (reward without NEURAL_PENALTY, board, blocks with used slot emptied
+        and empty slots moved last, streak). No redraw of blocks is performed.
     """
     board, blocks = board.copy(), blocks.copy()
     piece, x, y = bl.State.decode_action(action)
     cells = [(x + dx, y + dy) for dx, dy in bl.BLOCKS[blocks[piece]]]
     blocks[piece] = bl.EMPTY_SLOT
+    empty = blocks == bl.EMPTY_SLOT
+    blocks = np.concatenate([blocks[~empty], blocks[empty]])
     for cx, cy in cells:
         board[cx, cy] = True
 

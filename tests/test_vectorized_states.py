@@ -3,6 +3,7 @@ import pytest
 import torch
 
 import blokudoku_lib as bl
+import network_lib as net
 import reference as ref
 from blokudoku_lib import (
     BLOCKS_SIZE,
@@ -89,64 +90,107 @@ class TestStatesPrim:
         vs.available = bl.to_tensor(avail, torch.uint8)
         return vs, vs.states_prim()
 
-    def test_shapes_and_dtypes(self, prim):
-        _, (A, R, T, B, L, S) = prim
-        n = self.N
-        assert A.shape == T.shape == S.shape == R.shape == (n, NN_OUTPUT_FLAT)
-        assert B.shape == (n, NN_OUTPUT_FLAT, BOARD_FLAT)
-        assert L.shape == (n, NN_OUTPUT_FLAT, BLOCKS_TO_PICK)
-        assert A.dtype == T.dtype == S.dtype == B.dtype == torch.bool
-        assert R.dtype == torch.int16 and L.dtype == torch.uint8
+    @staticmethod
+    def segments(MC):
+        """(start, stop) row range of every game inside the stacked tensors."""
+        stops = np.cumsum(MC)
+        return list(zip(stops - MC, stops))
 
-    def test_illegal_actions_are_zeroed(self, prim):
-        _, (A, R, T, _, _, S) = prim
-        assert not (R[~A].any() or T[~A].any() or S[~A].any())
+    def test_shapes_and_dtypes(self, prim):
+        _, (A, R, T, B, L, S, MC) = prim
+        m = int(MC.sum())
+        assert MC.shape == (self.N,) and MC.dtype == torch.long
+        assert A.shape == R.shape == T.shape == (m,)
+        assert B.shape == (m, 1, BOARD_LEN, BOARD_LEN)
+        assert L.shape == (m, BLOCKS_TO_PICK)
+        assert S.shape == (m, 1)
+        assert A.dtype == torch.long and R.dtype == torch.int16
+        assert T.dtype == S.dtype == B.dtype == torch.bool
+        assert L.dtype == torch.uint8
+        for t in (A, R, T, B, L, S, MC):
+            assert t.device.type == DEVICE.type
+
+    def test_move_counts_and_game_major_order(self, prim):
+        vs, (A, _, _, _, _, _, MC) = prim
+        assert torch.equal(MC, vs.legal_moves().sum(dim=-1))
+        assert (MC == 0).sum() > 0  # some games are stuck
+        A, MC = to_numpy(A, MC)
+        for g, (lo, hi) in enumerate(self.segments(MC)):
+            expected = np.flatnonzero(vs.legal_moves()[g].cpu().numpy())
+            assert np.array_equal(A[lo:hi], expected), g
+
+    def test_nn_and_storage_ready(self, prim):
+        _, (_, _, _, B, L, S, _) = prim
+        boards, streaks = B.to(bl.MM_DTYPE), S.to(bl.MM_DTYPE)
+        assert boards.dtype == streaks.dtype == bl.MM_DTYPE
+        assert torch.equal(boards.bool(), B) and torch.equal(streaks.bool(), S)
+        storage = net.StateStorage(len(B))
+        storage.add_records(B, L, S, B, L, S, torch.zeros(len(B)), S.view(-1))
+        assert storage.size == len(B)
 
     def test_matches_reference(self, prim):
         vs, out = prim
         boards, avail, streaks = to_numpy(vs.boards, vs.available, vs.streaks)
         boards = boards.reshape(self.N, BOARD_LEN, BOARD_LEN)
-        A, R, T, B, L, S = to_numpy(*out)
+        A, R, T, B, L, S, MC = to_numpy(*out)
+        B = B.reshape(len(B), BOARD_FLAT)
 
         checked = 0
-        for g in range(self.N):
-            assert np.array_equal(ref.valid_mask(boards[g], avail[g]), A[g]), g
-            for a in np.flatnonzero(A[g]):
+        for g, (lo, hi) in enumerate(self.segments(MC)):
+            assert np.array_equal(np.flatnonzero(ref.valid_mask(boards[g], avail[g])), A[lo:hi]), g
+            for i in range(lo, hi):
+                a = int(A[i])
                 r, board, blocks, streak = ref.transition(
-                    boards[g], avail[g], streaks[g, 0], int(a)
+                    boards[g], avail[g], streaks[g, 0], a
                 )
-                assert np.array_equal(board.reshape(-1), B[g, a]), (g, a)
-                assert streak == S[g, a], (g, a)
+                assert np.array_equal(board.reshape(-1), B[i]), (g, a)
+                assert streak == S[i, 0], (g, a)
                 if (blocks == EMPTY_SLOT).all():
-                    assert (L[g, a] < BLOCKS_SIZE).all(), (g, a)
+                    assert (L[i] < BLOCKS_SIZE).all(), (g, a)
                 else:
-                    assert np.array_equal(blocks, L[g, a]), (g, a)
+                    assert np.array_equal(blocks, L[i]), (g, a)
                 # Terminal and its penalty depend on drawn blocks, so use L.
-                assert T[g, a] == (not ref.valid_mask(board, L[g, a]).any()), (g, a)
-                assert R[g, a] == r + (NEURAL_PENALTY if T[g, a] else 0), (g, a)
+                assert T[i] == (not ref.valid_mask(board, L[i]).any()), (g, a)
+                assert R[i] == r + (NEURAL_PENALTY if T[i] else 0), (g, a)
                 checked += 1
         assert checked > 1000
 
+    def test_empty_slots_moved_last(self, prim):
+        _, (_, _, _, _, L, _, _) = prim
+        empty = L == EMPTY_SLOT
+        assert (empty[:, :-1] <= empty[:, 1:]).all()
+
     def test_one_draw_of_new_blocks_per_game(self, prim):
-        vs, (A, _, _, _, L, _) = prim
+        vs, (_, _, _, _, L, _, MC) = prim
         one_left = (vs.available == EMPTY_SLOT).sum(1) == BLOCKS_TO_PICK - 1
         assert one_left.sum() > 50
-        for g in one_left.nonzero().flatten():
-            draws = L[g][A[g]]
-            if len(draws):  # the last block may not fit anywhere
-                assert (draws == draws[0]).all(), g
+        MC = MC.cpu().numpy()
+        for g, (lo, hi) in enumerate(self.segments(MC)):
+            if one_left[g] and hi > lo:  # the last block may not fit anywhere
+                assert (L[lo:hi] == L[lo]).all(), g
 
 
 class TestTransitions:
     @pytest.fixture
     def stepped(self, random_states):
-        """States after playing one random legal action per game."""
+        """States after playing one random legal action per playable game."""
         vs = random_states(64, 0.4, valid=True)
-        A, _, T, B, L, S = vs.states_prim()
-        g = torch.arange(vs.N, device=DEVICE)
-        actions = torch.multinomial(A.float() + 1e-9, 1).squeeze(1)
-        vs.mass_transition(B[g, actions], L[g, actions], S[g, actions].view(-1, 1))
-        return vs, A.any(1), T[g, actions]
+        _, _, T, B, L, S, MC = vs.states_prim()
+        playable = MC > 0
+        # Random row inside every playable game's segment.
+        offsets = MC.cumsum(0) - MC
+        rows = offsets + (torch.rand(vs.N, device=DEVICE) * MC).long()
+        rows = rows[playable]
+
+        boards, avail, streaks = vs.boards.clone(), vs.available.clone(), vs.streaks.clone()
+        boards[playable] = B[rows].view(-1, BOARD_FLAT)
+        avail[playable] = L[rows]
+        streaks[playable] = S[rows]
+        vs.mass_transition(boards.view(-1, 1, BOARD_LEN, BOARD_LEN), avail, streaks.view(-1))
+
+        terminal = torch.zeros(vs.N, dtype=torch.bool, device=DEVICE)
+        terminal[playable] = T[rows]
+        return vs, playable, terminal
 
     def test_mass_transition_keeps_shapes(self, stepped):
         vs, _, _ = stepped
@@ -172,12 +216,21 @@ class TestTransitions:
         for now, prev in zip((vs.boards, vs.available, vs.streaks), before):
             assert torch.equal(now[~done], prev[~done])
 
-    def test_nn_input(self, stepped):
+    def test_drop_removes_games(self, stepped):
         vs, _, _ = stepped
-        boards, blocks, streaks = vs.nn_input()
-        assert (
-            boards.shape == (64, 1, BOARD_LEN, BOARD_LEN) and boards.dtype == torch.bool
-        )
-        assert blocks.shape == (64, BLOCKS_TO_PICK)
-        assert streaks.shape == (64, 1) and streaks.dtype == torch.bool
-        assert torch.equal(boards.reshape(64, -1), vs.boards)
+        before = (vs.boards.clone(), vs.available.clone(), vs.streaks.clone())
+        dropped = torch.rand(64, device=DEVICE) < 0.5
+
+        vs.drop(dropped)
+
+        assert vs.N == int((~dropped).sum())
+        for now, prev in zip((vs.boards, vs.available, vs.streaks), before):
+            assert torch.equal(now, prev[~dropped])
+        _, _, _, _, _, _, MC = vs.states_prim()
+        assert MC.shape == (vs.N,)
+
+    def test_drop_all_is_empty_batch(self, stepped):
+        vs, _, _ = stepped
+        vs.drop(torch.ones(64, dtype=torch.bool, device=DEVICE))
+        assert vs.N == 0
+        assert vs.legal_moves().shape == (0, NN_OUTPUT_FLAT)
