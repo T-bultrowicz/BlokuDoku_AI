@@ -1,6 +1,8 @@
 import blokudoku_lib as bl
 import network_lib as net
 import user_play as user_play
+import profiling
+import logs
 
 import os
 import sys
@@ -9,7 +11,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import copy
-import profiling
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -26,7 +27,7 @@ NETWORKS_DIR.mkdir(exist_ok=True)
 GAMES_TO_PLAY_TRAIN = 60_000
 GAMES_TO_PLAY_TEST = 500
 GAMES_TO_PLAY_PROFILE = 3_000
-DISPLAY_ERR_FREQ = 1500
+DISPLAY_ERR_FREQ = 300
 GAMES_TO_DISPLAY_INFO = 250
 VAL_GAMES_CHUNK = 256  # Chunk size for val_net.
 VALIDATION_GAMES_PER_BATCH = 5
@@ -45,7 +46,7 @@ SIDE_TASK_WEIGHT = 7.0
 EPS_THRESHOLD = 0.15
 STEP_TO_MODIFY = 15000
 GAMMA = 0.5
-
+DELTA_L1_LOSS = 5.0
 
 def try_write_best_net(
     netw: nn.Module,
@@ -84,7 +85,7 @@ def try_write_best_net(
 
         with open(filepath_score, "w") as f:
             f.write(str(current_score))
-        print(f"Base score set: {current_score:.2f}")
+        logs.log("best", f"base score set {current_score:.2f}")
         return
 
     with open(filepath_score, "r") as f:
@@ -93,6 +94,8 @@ def try_write_best_net(
         except ValueError:
             saved_score = netw_res
     if netw_res + MARGIN < saved_score:
+        logs.log("fight", "skipped", f"{netw_res:.2f} vs saved {saved_score:.2f}",
+                 f"margin {MARGIN:.0f}")  # fmt: skip
         return
 
     saved_net = copy.deepcopy(netw)
@@ -109,23 +112,21 @@ def try_write_best_net(
 
         with open(filepath_score, "w") as f:
             f.write(str(current_score))
-        print(f"New best score: {current_score:.2f}")
+        logs.log("best", f"saved weights unreadable, overwritten", f"score {current_score:.2f}")
         return
 
-    print(f"\nStarting game validation - two agent fight ...")
+    logs.log("fight", f"current net vs saved net", f"{val_games_num} games each")
     current_score, _ = val_net(netw, val_games_num)  # type: ignore
     saved_score, _ = val_net(saved_net, val_games_num)  # type: ignore
 
     # Kto wygrał?
     if current_score > saved_score:
-        print(
-            f"We got new champion! - result of: {current_score:.2f} vs {saved_score:.2f}"
-        )
+        logs.log("fight", "new champion", f"{current_score:.2f} vs {saved_score:.2f}")
         torch.save(netw.state_dict(), filepath_net)
         with open(filepath_score, "w") as f:
             f.write(str(current_score))
     else:
-        print(f"Saved net held - result of: {current_score:.2f} vs {saved_score:.2f}")
+        logs.log("fight", "saved net held", f"{current_score:.2f} vs {saved_score:.2f}")
         with open(filepath_score, "w") as f:
             f.write(str(saved_score))
 
@@ -251,7 +252,7 @@ def calculate_aux_targets(boards_tensor: torch.Tensor):
 
     Returns:
         torch.Tensor of shape (Batch_num, Aux_feat_num), where aux features include:
-        1. Sum of taken fileds.
+        1. Sum of taken fields.
         2. Non empty columns counter.
         3. Non emprt rows counter.
         4. Non empty 3x3 blocks counter.
@@ -309,13 +310,11 @@ class ActionNetworkTrainer:
         try:
             net.load_weights(main_net, self.SAVE_PATH)
         except Exception as e:
-            print(
-                f"Error - didn't managed to find network params in filepath{self.SAVE_PATH}\n"
-            )
+            logs.log("error", f"didn't managed to find network params at {self.SAVE_PATH}")
             return
 
         score, score_std = val_net(main_net, games_to_play)  # type: ignore
-        print(f"Tested model performance - mean score: {score:.2f}, std: {score_std:.2f}")
+        logs.log("test", f"games {games_to_play}", f"mean {score:.2f}", f"std {score_std:.2f}")
 
     def _play_parallel_games(
         self,
@@ -348,6 +347,7 @@ class ActionNetworkTrainer:
         target_net: net.BL_DQN_Action_Network_v1,
         storage: net.ActionsStorage,
         optimizer: torch.optim.Adam,
+        display_err: bool = False,
     ):
         if storage.size < BATCH_SIZE:
             return
@@ -373,7 +373,9 @@ class ActionNetworkTrainer:
             target_moves = torch.max(y_hat_nn_target, dim=1).values
 
         target_fn = b_rewards + (1 - b_terminals) * DISCOUNT * target_moves
-        losses = F.mse_loss(q_pred_fn, target_fn)
+        losses = F.huber_loss(q_pred_fn, target_fn, delta=DELTA_L1_LOSS)
+        if display_err:
+            logs.log_td_error(q_pred_fn, target_fn)
 
         optimizer.zero_grad()
         losses.backward()
@@ -391,14 +393,10 @@ class ActionNetworkTrainer:
             return games_played_mod, batch_start_time
 
         elapsed = time.perf_counter() - batch_start_time
-        games_per_second = GAMES_TO_DISPLAY_INFO / elapsed if elapsed else float("inf")
-        print(
-            f"Games played: {games_played}, Games per second: "
-            + f"{games_per_second:.2f}, batch time: {elapsed:.2f}s, eps: {eps:.4f}"
-        )
-        print(f"Validating model performance...")
+        logs.log_progress(games_played, GAMES_TO_DISPLAY_INFO, elapsed, eps)
         score, score_std = val_net(main_net, VALIDATION_GAMES_PER_BATCH)  # type: ignore
-        print(f"Points in val games - mean: {score:.2f}, std: {score_std:.2f}\n")
+        logs.log_validation(VALIDATION_GAMES_PER_BATCH, score, score_std)
+        print()
 
         return games_played_mod % GAMES_TO_DISPLAY_INFO, time.perf_counter()
 
@@ -426,7 +424,9 @@ class ActionNetworkTrainer:
         loops = 0
         while games_played < games_to_play:
             terminals = self._play_parallel_games(states, main_net, storage, eps)
-            self._perform_gradient_descent(main_net, target_net, storage, optimizer)
+            self._perform_gradient_descent(
+                main_net, target_net, storage, optimizer, loops % DISPLAY_ERR_FREQ == 0
+            )
 
             loops += 1
             eps = max(EPS_MIN, eps * (DECAY_RATE**games_count))
@@ -460,9 +460,7 @@ class StateNetworkTrainer:
         try:
             net.load_weights(main_net, self.SAVE_PATH_NET)
         except Exception as e:
-            print(
-                f"Error - didn't managed to find network params in filepath{self.SAVE_PATH_NET}\n"
-            )
+            logs.log("error", f"didn't managed to find network params at {self.SAVE_PATH_NET}")
             return
 
         main_net.eval()
@@ -473,8 +471,9 @@ class StateNetworkTrainer:
             user_play.output_to_player(state, score, game_over)
             _, R, T, B, L, S, MC = self._gather_data(state._vs)
 
+            explore, keep = self._draw_exploration(MC, 0.0)
             q_per_move = self._forward_data(R, T, B, L, S, main_net)
-            row = self._agent_decide(q_per_move, MC, 0.0)
+            row = self._agent_decide(q_per_move, keep, MC, explore)
             state._vs.mass_transition(B[row], L[row], S[row])
             score += int(R[row])
             game_over = bool(T[row])
@@ -488,16 +487,12 @@ class StateNetworkTrainer:
         try:
             net.load_weights(main_net, self.SAVE_PATH_NET)
         except Exception as e:
-            print(
-                f"Error - didn't managed to find network params in filepath{self.SAVE_PATH_NET}\n"
-            )
+            logs.log("error", f"didn't managed to find network params at {self.SAVE_PATH_NET}")
             return
 
         score, score_std, max, min = val_net(main_net, games_to_play, True)  # type: ignore
-        print(
-            f"Tested model performance - mean score: {score:.2f}, std: {score_std:.2f}, \
-max:{max:.4f}, min:{min:.4f}"
-        )
+        logs.log("test", f"games {games_to_play}", f"mean {score:.2f}", f"std {score_std:.2f}",
+             f"max {max:.0f}", f"min {min:.0f}")  # fmt: skip
 
     def _get_components(self):
         return (
@@ -539,13 +534,52 @@ max:{max:.4f}, min:{min:.4f}"
         q_values = rewards + ~terminals * DISCOUNT * v_values
         return q_values
 
-    def _agent_decide(self, qs: torch.Tensor, lengths: torch.Tensor, eps: float):
-        """Choose move in every game, best one or with probability eps random legal one.
+    def _draw_exploration(self, lengths: torch.Tensor, eps: float):
+        """Draw which games explore this move, so that only moves of exploiting
+        games get valued by the network.
+
+        Args:
+            lengths: (N,) long, legal moves count per game, each > 0.
+            eps: probability of exploring, per game.
+
+        Returns:
+            explore: (N,) bools, True where the game plays a random move.
+            exploit_rows: (M',) long, rows of stacked moves that belong to
+            exploiting games, game-major.
+        """
+        explore = torch.rand(len(lengths), device=bl.DEVICE) < eps
+        exploit_rows = torch.repeat_interleave(~explore, lengths).nonzero().flatten()
+        return explore, exploit_rows
+
+    def _agent_decide(
+        self,
+        qs: torch.Tensor,
+        exploit_rows: torch.Tensor,
+        lengths: torch.Tensor,
+        explore: torch.Tensor,
+    ):
+        """Choose move in every game: best valued one where the game exploits,
+        random legal one where it explores.
+
+        Args:
+            qs: (M',) values of moves at exploit_rows.
+            exploit_rows: (M',) long, as returned by _draw_exploration.
+            lengths: (N,) long, legal moves count per game, each > 0.
+            explore: (N,) bools, as returned by _draw_exploration.
 
         Returns:
             rows: (N,) long, row of chosen move for every game.
         """
-        return _eps_greedy_rows(qs, lengths, eps)
+        N, exploit = len(lengths), ~explore
+        n_exploit = int(exploit.sum())
+        # Random legal row of every game, overwritten where the game exploits.
+        offsets = lengths.cumsum(0) - lengths
+        rows = offsets + (torch.rand(N, device=bl.DEVICE) * lengths).long()
+        gid = torch.repeat_interleave(
+            torch.arange(n_exploit, device=bl.DEVICE), lengths[exploit], output_size=len(qs)
+        )
+        rows[exploit] = exploit_rows[_segment_argmax(qs, gid, n_exploit)]
+        return rows
 
     def _env_update(
         self,
@@ -600,7 +634,9 @@ max:{max:.4f}, min:{min:.4f}"
             ).squeeze(1)
 
         target_fn = b_rewards + (1 - b_terminals) * DISCOUNT * y_hat_nn_target
-        losses = F.mse_loss(y_hat_nn_main, target_fn)
+        losses = F.huber_loss(y_hat_nn_main, target_fn, delta=DELTA_L1_LOSS)
+        if display_err:
+            logs.log_td_error(y_hat_nn_main, target_fn)
 
         optimizer.zero_grad()
         losses.backward()
@@ -613,17 +649,9 @@ max:{max:.4f}, min:{min:.4f}"
             return games_mod, start
 
         elapsed = time.perf_counter() - start
-        games_per_second = GAMES_TO_DISPLAY_INFO / elapsed if elapsed else float("inf")
-        print(
-            f"Games played: {games}, Games per second: "
-            + f"{games_per_second:.2f}, batch time: {elapsed:.2f}s, eps: {eps:.4f}"
-        )
-        print(f"Validating model performance...")
-
+        logs.log_progress(games, GAMES_TO_DISPLAY_INFO, elapsed, eps)
         score, score_std = val_net(main_net, VALIDATION_GAMES_PER_BATCH)  # type: ignore
-        print(f"Points in val games - mean: {score:.2f}, std: {score_std:.2f}")
-        print()
-
+        logs.log_validation(VALIDATION_GAMES_PER_BATCH, score, score_std)
         try_write_best_net(
             main_net,
             self.SAVE_PATH_NET,
@@ -631,6 +659,7 @@ max:{max:.4f}, min:{min:.4f}"
             VALIDATION_GAMES_PER_FIGHT,
             score,
         )
+        print()
         return games_mod % GAMES_TO_DISPLAY_INFO, time.perf_counter()
 
     def train_state_network(
@@ -658,10 +687,11 @@ max:{max:.4f}, min:{min:.4f}"
         games_played_mod = 0
         loops = 0
         while games_played < games_to_play:
-            # GATHER MOVES AND CHOOSE ONE PER GAME
+            # GATHER MOVES, VALUE ONLY THOSE OF EXPLOITING GAMES, CHOOSE ONE PER GAME
             _, R, T, B, L, S, MC = self._gather_data(states)
-            q_per_move = self._forward_data(R, T, B, L, S, main_net)
-            rows = self._agent_decide(q_per_move, MC, eps)
+            explore, keep = self._draw_exploration(MC, eps)
+            q_exploit = self._forward_data(R[keep], T[keep], B[keep], L[keep], S[keep], main_net)
+            rows = self._agent_decide(q_exploit, keep, MC, explore)
 
             # PLAY THEM
             term_sum = self._env_update(
@@ -729,10 +759,12 @@ class AdvancedTrainer(StateNetworkTrainer):
             v_next = v_next.squeeze(1)
 
         target_v = b_rewards + (1 - b_terminals) * DISCOUNT * v_next
-        loss_v = F.smooth_l1_loss(v_pred, target_v)
+        loss_v = F.huber_loss(v_pred, target_v, delta=DELTA_L1_LOSS)
+        if display_err:
+            logs.log_td_error(v_pred, target_v)
 
         target_aux = calculate_aux_targets(nn_brd_s)
-        loss_aux = F.mse_loss(aux_pred, target_aux)
+        loss_aux = F.huber_loss(aux_pred, target_aux)
 
         total_loss = loss_v + SIDE_TASK_WEIGHT * loss_aux
         optimizer.zero_grad()
@@ -928,12 +960,10 @@ def main(args):
             "action": T_ActionNetworkTrainer,
         }
         trainer = timed_models[args[2]]()
-        print(f"Beginning diagnostics on {games_to_play} games of training!")
-
+        logs.log("profile", f"timing {games_to_play} games of training")
         with trainer.timed_run("train"):
             _train_fn(trainer)(games_to_play)
         trainer.profiler.report()
-
 
 def cli():
     """Entry point of the `blokudoku` command (see [project.scripts])."""

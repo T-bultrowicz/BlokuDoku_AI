@@ -3,6 +3,7 @@ import pytest
 import torch
 
 import blokudoku_lib as bl
+import logs
 import main
 import network_lib as net
 from blokudoku_lib import BLOCKS_TO_PICK, BOARD_FLAT, BOARD_LEN, DEVICE, NEURAL_PENALTY
@@ -88,7 +89,9 @@ class TestAgentDecide:
 
     def test_greedy_when_eps_zero(self, stacked):
         qs, lengths = stacked
-        rows = main.StateNetworkTrainer()._agent_decide(qs, lengths, 0.0)
+        trainer = main.StateNetworkTrainer()
+        explore, keep = trainer._draw_exploration(lengths, 0.0)
+        rows = trainer._agent_decide(qs, keep, lengths, explore)
         expected = [lo + int(qs[lo:hi].argmax()) for lo, hi in segments(lengths)]
         assert rows.tolist() == expected
 
@@ -208,8 +211,9 @@ class TestStateTrainers:
         trainer = trainer_cls()
         main_net, _, _ = trainer._get_components()
         _, R, T, B, L, S, MC = trainer._gather_data(bl.VectorizedStates(3))
+        explore, keep = trainer._draw_exploration(MC, 0.0)
         qs = trainer._forward_data(R, T, B, L, S, main_net)
-        rows = trainer._agent_decide(qs, MC, 0.0)
+        rows = trainer._agent_decide(qs, keep, MC, explore)
         assert qs.shape == (int(MC.sum()),) and torch.isfinite(qs).all()
         assert rows.shape == (3,)
 
@@ -254,7 +258,7 @@ class TestTrainingSideEffects:
         assert (tmp_path / "net.pt").exists()
         saved = float((tmp_path / "score.txt").read_text())
         assert saved >= 0  # NEURAL_PENALTY already excluded
-        assert "Points in val games" in capsys.readouterr().out
+        assert "[val]" in capsys.readouterr().out
 
     def test_timed_trainer_measures_nested_stages(self, monkeypatch, capsys):
         trainer = main.T_LightTrainer()
@@ -398,3 +402,54 @@ class TestActionTrainer:
             )
         assert storage.size == 10 and storage.offset == 4
         assert storage.buffers[7].tolist() == [10, 11, 12, 13, 4, 5, 6, 7, 8, 9]
+
+
+class TestTdErrorLogging:
+    def test_stats_are_mean_and_percentiles_of_abs_error(self):
+        predicted = torch.arange(11, dtype=torch.float, device=DEVICE)  # 0..10
+        actual = torch.zeros(11, device=DEVICE)
+        mean, p10, p90 = logs.td_error_stats(predicted - 100, actual - 100)
+        assert mean == pytest.approx(5.0)
+        assert p10 == pytest.approx(1.0) and p90 == pytest.approx(9.0)
+
+    def test_sign_of_error_does_not_matter(self):
+        predicted = torch.tensor([3.0, -3.0, 0.0], device=DEVICE)
+        actual = torch.tensor([0.0, 0.0, 3.0], device=DEVICE)
+        mean, _, _ = logs.td_error_stats(predicted, actual)
+        assert mean == pytest.approx(3.0)
+
+    @pytest.mark.parametrize("trainer_cls", STATE_TRAINERS)
+    def test_gradient_step_logs_only_when_asked(self, trainer_cls, monkeypatch, capsys):
+        monkeypatch.setattr(main, "BATCH_SIZE", 32)
+        trainer = trainer_cls()
+        main_net, target_net, storage = trainer._get_components()
+        storage.add_records(*random_storage_records(4000))
+        optimizer = trainer._get_optimizer(main_net, main.LEARING_OPTIM_RATE)
+
+        trainer._perform_gradient_descent(main_net, target_net, storage, optimizer)
+        assert "[td err]" not in capsys.readouterr().out
+        trainer._perform_gradient_descent(main_net, target_net, storage, optimizer, True)
+        line = capsys.readouterr().out
+        assert line.startswith("[td err]") and "p10" in line and "p90" in line
+
+    def test_training_loop_logs_errors_periodically(self, monkeypatch, capsys):
+        trainer = main.LightTrainer()
+        monkeypatch.setattr(trainer, "_get_components", small_components)
+        monkeypatch.setattr(main, "BATCH_SIZE", 16)
+        monkeypatch.setattr(main, "GAMES_TO_DISPLAY_INFO", 10**9)
+        monkeypatch.setattr(main, "DISPLAY_ERR_FREQ", 2)
+        trainer.train_state_network(games_to_play=4, games_count=2)
+        assert capsys.readouterr().out.count("[td err]") >= 5
+
+
+class TestBestNetLogs:
+    def test_skipped_fight_is_logged(self, tmp_path, capsys):
+        netw = small_net()
+        torch.save(netw.state_dict(), tmp_path / "net.pt")
+        (tmp_path / "score.txt").write_text("1000.0")
+
+        main.try_write_best_net(netw, tmp_path / "net.pt", tmp_path / "score.txt", 2, 10.0)
+
+        out = capsys.readouterr().out
+        assert out.startswith("[fight]") and "skipped" in out
+        assert (tmp_path / "score.txt").read_text() == "1000.0"
