@@ -46,7 +46,7 @@ SIDE_TASK_WEIGHT = 7.0
 EPS_THRESHOLD = 0.15
 STEP_TO_MODIFY = 15000
 GAMMA = 0.5
-DELTA_L1_LOSS = 5.0
+DELTA_L1_LOSS = 15.0
 
 def try_write_best_net(
     netw: nn.Module,
@@ -373,7 +373,7 @@ class ActionNetworkTrainer:
             target_moves = torch.max(y_hat_nn_target, dim=1).values
 
         target_fn = b_rewards + (1 - b_terminals) * DISCOUNT * target_moves
-        losses = F.huber_loss(q_pred_fn, target_fn, delta=DELTA_L1_LOSS)
+        losses = F.mse_loss(q_pred_fn, target_fn)
         if display_err:
             logs.log_td_error(q_pred_fn, target_fn)
 
@@ -634,7 +634,7 @@ class StateNetworkTrainer:
             ).squeeze(1)
 
         target_fn = b_rewards + (1 - b_terminals) * DISCOUNT * y_hat_nn_target
-        losses = F.huber_loss(y_hat_nn_main, target_fn, delta=DELTA_L1_LOSS)
+        losses = F.mse_loss(y_hat_nn_main, target_fn)
         if display_err:
             logs.log_td_error(y_hat_nn_main, target_fn)
 
@@ -759,12 +759,12 @@ class AdvancedTrainer(StateNetworkTrainer):
             v_next = v_next.squeeze(1)
 
         target_v = b_rewards + (1 - b_terminals) * DISCOUNT * v_next
-        loss_v = F.huber_loss(v_pred, target_v, delta=DELTA_L1_LOSS)
+        loss_v = F.mse_loss(v_pred, target_v)
         if display_err:
             logs.log_td_error(v_pred, target_v)
 
         target_aux = calculate_aux_targets(nn_brd_s)
-        loss_aux = F.huber_loss(aux_pred, target_aux)
+        loss_aux = F.mse_loss(aux_pred, target_aux)
 
         total_loss = loss_v + SIDE_TASK_WEIGHT * loss_aux
         optimizer.zero_grad()
